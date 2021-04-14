@@ -6,8 +6,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
-      - uses: actions/setup-node@v1
+      - uses: ruby/setup-ruby@v1
         with:
-          node-version: 12
-      - run: #TODO yarn
-      - run: #yarn lint
+          ruby-version: 2.6
+          bundler-cache: true # runs 'bundle install' and caches installed gems automatically
+      - uses: actions/cache@v2
+        with:
+          path: "./vendor/bundle"
+          key: v1/${{ runner.os }}/ruby-2.6/${{ hashFiles('**/Gemfile.lock') }}
+          restore-keys: v1/${{ runner.os }}/ruby-2.6/
+      - run: bundle exec rubocop
