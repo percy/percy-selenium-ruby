@@ -1,17 +1,15 @@
 require 'net/http'
 require 'uri'
 require 'json'
+require 'version'
 
 module Percy
-  VERSION = '1.0.0-beta.0'.freeze
   CLIENT_INFO = "percy-selenium-ruby/#{VERSION}".freeze
   PERCY_DEBUG = ENV['PERCY_LOGLEVEL'] == 'debug'
   PERCY_SERVER_ADDRESS = ENV['PERCY_SERVER_ADDRESS'] || 'http://localhost:5338'
   LABEL = "[\u001b[35m" + (PERCY_DEBUG ? 'percy:ruby' : 'percy') + "\u001b[39m]"
 
-  # Takes a snapshot of the given page HTML and its assets.
-  #
-  # @param
+  # Take a DOM snapshot and post it to the snapshot endpoint
   def self.snapshot(driver, name, options = {})
     return unless percy_enabled?
 
@@ -35,6 +33,7 @@ module Percy
     end
   end
 
+  # Determine if the Percy server is running, caching the result so it is only checked once
   def self.percy_enabled?
     return @percy_enabled unless @percy_enabled.nil?
 
@@ -68,6 +67,7 @@ module Percy
     end
   end
 
+  # Fetch the @percy/dom script, caching the result so it is only fetched once
   def self.fetch_percy_dom
     return @percy_dom unless @percy_dom.nil?
 
@@ -79,6 +79,8 @@ module Percy
     puts "#{LABEL} #{msg}"
   end
 
+  # Make an HTTP request (GET,POST) using Ruby's Net::HTTP. If `data` is present,
+  # `fetch` will POST as JSON.
   def self.fetch(url, data = nil)
     uri = URI("#{PERCY_SERVER_ADDRESS}/#{url}")
 

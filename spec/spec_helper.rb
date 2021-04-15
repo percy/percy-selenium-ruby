@@ -1,7 +1,7 @@
 # This must be required & started before any app code (for proper coverage)
 require 'simplecov'
-SimpleCov.minimum_coverage 100
 SimpleCov.start
+SimpleCov.minimum_coverage 100
 
 require 'rack'
 require 'percy'
