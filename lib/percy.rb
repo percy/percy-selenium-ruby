@@ -2,9 +2,12 @@ require 'net/http'
 require 'uri'
 require 'json'
 require 'version'
+require 'selenium-webdriver'
 
 module Percy
   CLIENT_INFO = "percy-selenium-ruby/#{VERSION}".freeze
+  ENV_INFO = "selenium/#{Selenium::WebDriver::VERSION} ruby/#{RUBY_VERSION}".freeze
+
   PERCY_DEBUG = ENV['PERCY_LOGLEVEL'] == 'debug'
   PERCY_SERVER_ADDRESS = ENV['PERCY_SERVER_ADDRESS'] || 'http://localhost:5338'
   LABEL = "[\u001b[35m" + (PERCY_DEBUG ? 'percy:ruby' : 'percy') + "\u001b[39m]"
@@ -21,7 +24,8 @@ module Percy
         name: name,
         url: driver.current_url,
         dom_snapshot: dom_snapshot,
-        client_info: CLIENT_INFO,)
+        client_info: CLIENT_INFO,
+        environment_info: ENV_INFO,)
 
       unless response.body.to_json['success']
         raise StandardError, data['error']

@@ -96,13 +96,14 @@ RSpec.describe Percy, type: :feature do
 
       expect(WebMock).to have_requested(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/snapshot")
         .with(
-          body: '{' \
-          '"name":"Name",' \
-          '"url":"http://127.0.0.1:3003/index.html",' \
-          '"dom_snapshot":' \
-          '"<html><head><title>I am a page</title></head><body>Snapshot me\n</body></html>",' \
-          '"client_info":"percy-selenium-ruby/' + Percy::VERSION + '"' \
-        '}',
+          body: {
+            name: 'Name',
+            url: 'http://127.0.0.1:3003/index.html',
+            dom_snapshot:
+              "<html><head><title>I am a page</title></head><body>Snapshot me\n</body></html>",
+            client_info: "percy-selenium-ruby/#{Percy::VERSION}",
+            environment_info: "selenium/#{Selenium::WebDriver::VERSION} ruby/#{RUBY_VERSION}",
+          }.to_json,
         ).once
     end
   end
