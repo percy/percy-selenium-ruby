@@ -1,5 +1,9 @@
 name: Test
-on: push
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
 jobs:
   test:
     name: Test
@@ -19,5 +23,4 @@ jobs:
           path: "./vendor/bundle"
           key: v1/${{ runner.os }}/ruby-${{ matrix.ruby }}/${{ hashFiles('**/Gemfile.lock') }}
           restore-keys: v1/${{ runner.os }}/ruby-${{ matrix.ruby }}/
-      - run: yarn
       - run: bundle exec rspec

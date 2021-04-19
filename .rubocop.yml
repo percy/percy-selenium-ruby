@@ -1,15 +1,11 @@
 inherit_gem:
   percy-style:
     - default.yml
-
-
 RSpec/InstanceVariable:
   Exclude:
     -
-
 RSpec/ContextWording:
   Enabled: false
-
 AllCops:
   TargetRubyVersion: 2.4
   Include:

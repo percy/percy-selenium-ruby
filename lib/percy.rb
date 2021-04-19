@@ -47,9 +47,9 @@ module Percy
 
       if version.nil?
         log('You may be using @percy/agent ' \
-                 'which is no longer supported by this SDK. ' \
-                 'Please uninstall @percy/agent and install @percy/cli instead. ' \
-                 'https://docs.percy.io/docs/migrating-to-percy-cli')
+            'which is no longer supported by this SDK. ' \
+            'Please uninstall @percy/agent and install @percy/cli instead. ' \
+            'https://docs.percy.io/docs/migrating-to-percy-cli')
         @percy_enabled = false
         return false
       end
