@@ -1,7 +1,7 @@
-require 'net/http'
 require 'uri'
 require 'json'
 require 'version'
+require 'net/http'
 require 'selenium-webdriver'
 
 module Percy

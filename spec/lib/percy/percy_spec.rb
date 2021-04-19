@@ -1,6 +1,3 @@
-require 'socket'
-
-# coding: utf-8
 RSpec.describe Percy, type: :feature do
   before(:each) do
     WebMock.disable_net_connect!(allow: '127.0.0.1', disallow: 'localhost')
