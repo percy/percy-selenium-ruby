@@ -11,6 +11,11 @@ jobs:
         with:
           ruby-version: 2.6
           bundler-cache: true
+      - uses: actions/cache@v2
+        with:
+          path: "./vendor/bundle"
+          key: v1/${{ runner.os }}/ruby-2.6/${{ hashFiles('**/Gemfile.lock') }}
+          restore-keys: v1/${{ runner.os }}/ruby-2.6/
       - run: |
           echo "---\n:rubygems_api_key: $RUBYGEMS_API_KEY\n" > ~/.gem/credentials
       - run: bundle exec rake build
