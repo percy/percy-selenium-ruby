@@ -8,10 +8,12 @@ Gem::Specification.new do |spec|
   spec.version       = Percy::VERSION
   spec.authors       = ['Perceptual Inc.']
   spec.email         = ['team@percy.io']
-  spec.summary       = %q{Percy}
+  spec.summary       = %q{Percy visual testing for Ruby Selenium}
   spec.description   = %q{}
   spec.homepage      = ''
   spec.license       = 'MIT'
+  spec.required_ruby_version = '>= 2.3.0'
+
 
   spec.metadata = {
     'bug_tracker_uri' => 'https://github.com/percy/percy-selenium-ruby/issues',
