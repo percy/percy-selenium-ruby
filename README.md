@@ -1,4 +1,5 @@
 # percy-selenium-ruby
+[![Gem Version](https://badge.fury.io/rb/percy-selenium.svg)](https://badge.fury.io/rb/percy-selenium)
 ![Test](https://github.com/percy/percy-selenium-ruby/workflows/Test/badge.svg)
 
 [Percy](https://percy.io) visual testing for Ruby Selenium.
