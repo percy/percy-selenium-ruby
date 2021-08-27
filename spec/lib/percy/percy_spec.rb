@@ -89,7 +89,7 @@ RSpec.describe Percy, type: :feature do
         .to_return(status: 200, body: '{"success": "true" }', headers: {})
 
       visit 'index.html'
-      Percy.snapshot(page, 'Name')
+      Percy.snapshot(page, 'Name', widths: [944])
 
       expect(WebMock).to have_requested(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/snapshot")
         .with(
@@ -100,6 +100,7 @@ RSpec.describe Percy, type: :feature do
               "<html><head><title>I am a page</title></head><body>Snapshot me\n</body></html>",
             client_info: "percy-selenium-ruby/#{Percy::VERSION}",
             environment_info: "selenium/#{Selenium::WebDriver::VERSION} ruby/#{RUBY_VERSION}",
+            widths: [944],
           }.to_json,
         ).once
     end
