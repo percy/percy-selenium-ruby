@@ -106,3 +106,31 @@ RSpec.describe Percy, type: :feature do
     end
   end
 end
+
+RSpec.describe Percy, type: :feature do
+  before(:each) do
+    WebMock.reset!
+    WebMock.allow_net_connect!
+    Percy._clear_cache!
+  end
+
+  describe 'integration', type: :feature do
+    it 'sends snapshots to percy server' do
+      visit 'index.html'
+      Percy.snapshot(page, 'Name', widths: [375])
+      sleep 5 # wait for percy server to process
+      resp = Net::HTTP.get_response(URI("#{PercyCapybara::PERCY_SERVER_ADDRESS}/test/requests"))
+      requests = JSON.parse(resp.body)['requests']
+      healthcheck = requests[0]
+      expect(healthcheck['url']).to eq('/percy/healthcheck')
+
+      snap = requests[2]['body']
+      expect(snap['name']).to eq('Name')
+      expect(snap['url']).to eq('http://127.0.0.1:3003/index.html')
+      expect(snap['client_info']).to include('percy-selenium-ruby')
+      expect(snap['environment_info']).to include('selenium')
+      expect(snap['widths']).to eq([375])
+    end
+  end
+
+end
