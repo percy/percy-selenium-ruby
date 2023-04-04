@@ -53,4 +53,4 @@ jobs:
           cd ${{ github.workspace }} 
           yarn remove @percy/cli && yarn link `echo $PERCY_PACKAGES`
           npx percy --version
-      - run: npx percy exec -- bundle exec rspec
+      - run: npx percy exec --testing -- bundle exec rspec
