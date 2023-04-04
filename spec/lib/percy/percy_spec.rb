@@ -119,7 +119,7 @@ RSpec.describe Percy, type: :feature do
       visit 'index.html'
       Percy.snapshot(page, 'Name', widths: [375])
       sleep 5 # wait for percy server to process
-      resp = Net::HTTP.get_response(URI("#{PercyCapybara::PERCY_SERVER_ADDRESS}/test/requests"))
+      resp = Net::HTTP.get_response(URI("#{Percy::PERCY_SERVER_ADDRESS}/test/requests"))
       requests = JSON.parse(resp.body)['requests']
       healthcheck = requests[0]
       expect(healthcheck['url']).to eq('/percy/healthcheck')
