@@ -40,12 +40,7 @@ RSpec.configure do |config|
 
   # Setup for Capybara to test Jekyll static files served by Rack
   Capybara.server_port = 3003
-  Capybara.register_server :webrick do |app, port, host, **options|
-    require 'rackup/handler/webrick'
-    options = { Host: host, Port: port, AccessLog: [], Logger: WEBrick::Log.new(nil, 0) }.merge(options)
-    Rackup::Handler::WEBrick.run(app, **options)
-  end
   
-  Capybara.server = :webrick, { Silent: true }
+  Capybara.server = :puma, { Silent: true }
   Capybara.app = Rack::File.new(File.join(File.dirname(__FILE__), 'fixture'))
 end
