@@ -94,7 +94,7 @@ module Percy
     response = if data
       http = Net::HTTP.new(uri.host, uri.port)
       http.read_timeout = 600 # seconds
-      request = Net::HTTP::Post.new(url.path)
+      request = Net::HTTP::Post.new(uri.path)
       request.body = data.to_json
       http.request(request)
     else
