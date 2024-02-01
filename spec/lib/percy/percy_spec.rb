@@ -123,7 +123,7 @@ RSpec.describe Percy, type: :feature do
         .to_return(status: 200, body: '{"success": "true", "data": "sync_data" }', headers: {})
 
       visit 'index.html'
-      data = Percy.snapshot(page, 'Name', { :sync => true })
+      data = Percy.snapshot(page, 'Name', {sync: true})
 
       expect(WebMock).to have_requested(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/snapshot")
         .with(
