@@ -31,6 +31,9 @@ module Percy
       unless response.body.to_json['success']
         raise StandardError, data['error']
       end
+
+      body = JSON.parse(response.body)
+      body['data']
     rescue StandardError => e
       log("Could not take DOM snapshot '#{name}'")
 
@@ -90,7 +93,11 @@ module Percy
     uri = URI("#{PERCY_SERVER_ADDRESS}/#{url}")
 
     response = if data
-      Net::HTTP.post(uri, data.to_json)
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.read_timeout = 600 # seconds
+      request = Net::HTTP::Post.new(uri.path)
+      request.body = data.to_json
+      http.request(request)
     else
       Net::HTTP.get_response(uri)
     end

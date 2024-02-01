@@ -90,7 +90,7 @@ RSpec.describe Percy, type: :feature do
         .to_return(status: 200, body: '{"success": "true" }', headers: {})
 
       visit 'index.html'
-      Percy.snapshot(page, 'Name', widths: [944])
+      data = Percy.snapshot(page, 'Name', widths: [944])
 
       expect(WebMock).to have_requested(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/snapshot")
         .with(
@@ -104,6 +104,41 @@ RSpec.describe Percy, type: :feature do
             widths: [944],
           }.to_json,
         ).once
+
+      expect(data).to eq(nil)
+    end
+
+    it 'sends snapshots for sync' do
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/healthcheck")
+        .to_return(status: 200, body: '', headers: {'x-percy-core-version': '1.0.0'})
+
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/dom.js")
+        .to_return(
+          status: 200,
+          body: 'window.PercyDOM = { serialize: () => document.documentElement.outerHTML };',
+          headers: {},
+        )
+
+      stub_request(:post, 'http://localhost:5338/percy/snapshot')
+        .to_return(status: 200, body: '{"success": "true", "data": "sync_data" }', headers: {})
+
+      visit 'index.html'
+      data = Percy.snapshot(page, 'Name', {sync: true})
+
+      expect(WebMock).to have_requested(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/snapshot")
+        .with(
+          body: {
+            name: 'Name',
+            url: 'http://127.0.0.1:3003/index.html',
+            dom_snapshot:
+              "<html><head><title>I am a page</title></head><body>Snapshot me\n</body></html>",
+            client_info: "percy-selenium-ruby/#{Percy::VERSION}",
+            environment_info: "selenium/#{Selenium::WebDriver::VERSION} ruby/#{RUBY_VERSION}",
+            widths: [944],
+          }.to_json,
+        ).once
+
+      expect(data).to eq('sync_data')
     end
   end
 end
