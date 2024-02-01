@@ -32,7 +32,8 @@ module Percy
         raise StandardError, data['error']
       end
 
-      response.body.to_json['data']
+      body = JSON.parse(response.body)
+      body['data']
     rescue StandardError => e
       log("Could not take DOM snapshot '#{name}'")
 
