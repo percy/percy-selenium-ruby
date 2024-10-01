@@ -11,6 +11,7 @@ module Percy
   PERCY_DEBUG = ENV['PERCY_LOGLEVEL'] == 'debug'
   PERCY_SERVER_ADDRESS = ENV['PERCY_SERVER_ADDRESS'] || 'http://localhost:5338'
   LABEL = "[\u001b[35m" + (PERCY_DEBUG ? 'percy:ruby' : 'percy') + "\u001b[39m]"
+  RESONSIVE_CAPTURE_SLEEP_TIME = ENV['RESONSIVE_CAPTURE_SLEEP_TIME']
 
   # Take a DOM snapshot and post it to the snapshot endpoint
   def self.snapshot(driver, name, options = {})
@@ -18,7 +19,12 @@ module Percy
 
     begin
       driver.execute_script(fetch_percy_dom)
-      dom_snapshot = driver.execute_script("return PercyDOM.serialize(#{options.to_json})")
+      dom_snapshot = nil
+      if is_responsive_snapshot_capture?(options)
+        dom_snapshot = capture_responsive_dom(driver, options)
+      else
+        dom_snapshot = get_serialized_dom(driver, options)
+      end
 
       response = fetch('percy/snapshot',
         name: name,
@@ -36,9 +42,94 @@ module Percy
       body['data']
     rescue StandardError => e
       log("Could not take DOM snapshot '#{name}'")
-
-      if PERCY_DEBUG then log(e) end
+      log(e, "debug")
     end
+  end
+
+  def self.get_browser_instance(driver)
+    if driver.is_a?(Capybara::Session)
+      return driver.driver.browser.manage
+    end
+    return driver.manage
+  end
+
+  def self.get_serialized_dom(driver, options)
+    dom_snapshot = driver.execute_script("return PercyDOM.serialize(#{options.to_json})")
+
+    dom_snapshot['cookies'] = get_browser_instance(driver).all_cookies
+    dom_snapshot
+  end
+  
+  def self.get_widths_for_multi_dom(options)
+    user_passed_widths = options[:widths] || []
+  
+    # Deep copy mobile widths otherwise it will get overridden
+    all_widths = @eligible_widths['mobile']&.dup || []
+    if user_passed_widths.any?
+      all_widths.concat(user_passed_widths)
+    else
+      all_widths.concat(@eligible_widths['config'] || [])
+    end
+  
+    all_widths.uniq
+  end
+  
+  def self.change_window_dimension_and_wait(driver, width, height, resize_count)
+    begin
+      if driver.capabilities.browser_name == 'chrome' && driver.respond_to?(:execute_cdp)
+        driver.execute_cdp('Emulation.setDeviceMetricsOverride', {
+          height: height, width: width, deviceScaleFactor: 1, mobile: false
+        })
+      else
+        get_browser_instance(driver).window.resize_to(width, height)
+      end
+    rescue StandardError => e
+      log("Resizing using cdp failed, falling back to driver for width #{width} #{e}", 'debug')
+      get_browser_instance(driver).window.resize_to(width, height)
+    end
+  
+    begin
+      wait = Selenium::WebDriver::Wait.new(timeout: 1)
+      wait.until { driver.execute_script("return window.resizeCount") == resize_count }
+    rescue Selenium::WebDriver::Error::TimeoutError
+      log("Timed out waiting for window resize event for width #{width}", 'debug')
+    end
+  end
+  
+  def self.capture_responsive_dom(driver, options)
+    widths = get_widths_for_multi_dom(options)
+    dom_snapshots = []
+    window_size = get_browser_instance(driver).window.size
+    current_width, current_height = window_size.width, window_size.height
+    last_window_width = current_width
+    resize_count = 0
+    driver.execute_script("PercyDOM.waitForResize()")
+  
+    widths.each do |width|
+      if last_window_width != width
+        resize_count += 1
+        change_window_dimension_and_wait(driver, width, current_height, resize_count)
+        last_window_width = width
+      end
+  
+      sleep(RESONSIVE_CAPTURE_SLEEP_TIME.to_i) if defined?(RESONSIVE_CAPTURE_SLEEP_TIME)
+      
+      dom_snapshot = get_serialized_dom(driver, options)
+      dom_snapshot['width'] = width
+      dom_snapshots << dom_snapshot
+    end
+  
+    change_window_dimension_and_wait(driver, current_width, current_height, resize_count + 1)
+    dom_snapshots
+  end  
+
+  def self.is_responsive_snapshot_capture?(options)
+    # Don't run responsive snapshot capture when defer uploads is enabled
+    return false if @cli_config && @cli_config.dig('percy', 'deferUploads')
+
+    options[:responsive_snapshot_capture] || 
+      options[:responsiveSnapshotCapture] || 
+        (@cli_config && @cli_config.dig('snapshot', 'responsiveSnapshotCapture'))
   end
 
   # Determine if the Percy server is running, caching the result so it is only checked once
@@ -64,12 +155,14 @@ module Percy
         return false
       end
 
+      response_body = JSON.parse(response.body)
+      @eligible_widths = response_body['widths']
+      @cli_config = response_body["config"]
       @percy_enabled = true
       true
     rescue StandardError => e
       log('Percy is not running, disabling snapshots')
-
-      if PERCY_DEBUG then log(e) end
+      log(e, 'debug')
       @percy_enabled = false
       false
     end
@@ -83,8 +176,19 @@ module Percy
     @percy_dom = response.body
   end
 
-  def self.log(msg)
-    puts "#{LABEL} #{msg}"
+  def self.log(msg, lvl = 'info')
+    msg = "#{LABEL} #{msg}"
+    begin
+      fetch('percy/log', { message: msg, level: lvl })
+    rescue StandardError => e
+      if PERCY_DEBUG
+        puts "Sending log to CLI Failed #{e}"
+      end
+    ensure
+      if lvl != 'debug' || PERCY_DEBUG
+        puts msg
+      end
+    end
   end
 
   # Make an HTTP request (GET,POST) using Ruby's Net::HTTP. If `data` is present,
@@ -112,5 +216,7 @@ module Percy
   def self._clear_cache!
     @percy_dom = nil
     @percy_enabled = nil
+    @eligible_widths = nil
+    @cli_config = nil
   end
 end
