@@ -169,6 +169,50 @@ RSpec.describe Percy, type: :feature do
       expect(data).to eq(nil)
     end
 
+    it 'sends multiple dom snapshots to the local server using selenium' do
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/healthcheck").to_return(
+        status: 200,
+        body: '{"success": "true", "widths": { "mobile": [390], "config": [765, 1280]} }',
+        headers: {
+          'x-percy-core-version': '1.0.0',
+          'config': {}, 'widths': {'mobile': [375], 'config': [765, 1280]},
+        },
+      )
+
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/dom.js")
+        .to_return(
+          status: 200,
+          body: fetch_script_string,
+          headers: {},
+        )
+
+      stub_request(:post, 'http://localhost:5338/percy/snapshot')
+        .to_return(status: 200, body: '{"success": "true" }', headers: {})
+
+      driver = Selenium::WebDriver.for :firefox
+
+      driver.navigate.to "http://localhost:5338/test/snapshot"
+      data = Percy.snapshot(driver, 'Name', {responsive_snapshot_capture: true})
+
+      expect(WebMock).to have_requested(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/snapshot")
+        .with(
+          body: {
+            name: 'Name',
+            url: 'http://localhost:5338/test/snapshot',
+            dom_snapshot: [
+              {'cookies': [], 'html': '<html><head></head><body><p>Snapshot Me!</p></body></html>', 'width': 390},
+              {'cookies': [], 'html': '<html><head></head><body><p>Snapshot Me!</p></body></html>', 'width': 765},
+              {'cookies': [], 'html': '<html><head></head><body><p>Snapshot Me!</p></body></html>', 'width': 1280},
+            ],
+            client_info: "percy-selenium-ruby/#{Percy::VERSION}",
+            environment_info: "selenium/#{Selenium::WebDriver::VERSION} ruby/#{RUBY_VERSION}",
+            responsive_snapshot_capture: true,
+          }.to_json,
+        ).once
+
+      expect(data).to eq(nil)
+    end
+
     it 'sends snapshots for sync' do
       stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/healthcheck")
         .to_return(status: 200, body: '{"success": "true" }',
