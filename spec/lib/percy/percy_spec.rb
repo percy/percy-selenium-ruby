@@ -1,7 +1,23 @@
 # rubocop:disable RSpec/MultipleDescribes
 RSpec.describe Percy, type: :feature do
+  dom_string = "<html><head><title>I am a page</title></head><body>Snapshot me\n</body></html>"
+  fetch_script_string = 'window.PercyDOM = {' \
+  'serialize: () => {' \
+    'return {' \
+      'html: document.documentElement.outerHTML,' \
+      'cookies: ""' \
+    '}' \
+  '},' \
+  'waitForResize: () => {' \
+    'if(!window.resizeCount) {' \
+      'window.addEventListener(\'resize\', () => window.resizeCount++)' \
+    '}' \
+    'window.resizeCount = 0;' \
+  '}};'
+
   before(:each) do
     WebMock.disable_net_connect!(allow: '127.0.0.1', disallow: 'localhost')
+    stub_request(:post, 'http://localhost:5338/percy/log').to_raise(StandardError)
     Percy._clear_cache!
   end
 
@@ -59,12 +75,13 @@ RSpec.describe Percy, type: :feature do
 
     it 'logs an error  when sending a snapshot fails' do
       stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/healthcheck")
-        .to_return(status: 200, body: '', headers: {'x-percy-core-version': '1.0.0'})
+        .to_return(status: 200, body: '{"success": "true" }',
+                   headers: {'x-percy-core-version': '1.0.0'},)
 
       stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/dom.js")
         .to_return(
           status: 200,
-          body: 'window.PercyDOM = { serialize: () => document.documentElement.outerHTML };',
+          body: fetch_script_string,
           headers: {},
         )
 
@@ -77,12 +94,14 @@ RSpec.describe Percy, type: :feature do
 
     it 'sends snapshots to the local server' do
       stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/healthcheck")
-        .to_return(status: 200, body: '', headers: {'x-percy-core-version': '1.0.0'})
+        .to_return(status: 200, body: '{"success": "true" }', headers: {
+                     'x-percy-core-version': '1.0.0',
+                   },)
 
       stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/dom.js")
         .to_return(
           status: 200,
-          body: 'window.PercyDOM = { serialize: () => document.documentElement.outerHTML };',
+          body: fetch_script_string,
           headers: {},
         )
 
@@ -98,7 +117,7 @@ RSpec.describe Percy, type: :feature do
             name: 'Name',
             url: 'http://127.0.0.1:3003/index.html',
             dom_snapshot:
-              "<html><head><title>I am a page</title></head><body>Snapshot me\n</body></html>",
+              {"cookies": [], "html": dom_string},
             client_info: "percy-selenium-ruby/#{Percy::VERSION}",
             environment_info: "selenium/#{Selenium::WebDriver::VERSION} ruby/#{RUBY_VERSION}",
             widths: [944],
@@ -108,14 +127,106 @@ RSpec.describe Percy, type: :feature do
       expect(data).to eq(nil)
     end
 
-    it 'sends snapshots for sync' do
-      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/healthcheck")
-        .to_return(status: 200, body: '', headers: {'x-percy-core-version': '1.0.0'})
+    it 'sends multiple dom snapshots to the local server' do
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/healthcheck").to_return(
+        status: 200,
+        body: '{"success": "true", "widths": { "mobile": [390], "config": [765, 1280]} }',
+        headers: {
+          'x-percy-core-version': '1.0.0',
+          'config': {}, 'widths': {'mobile': [375], 'config': [765, 1280]},
+        },
+      )
 
       stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/dom.js")
         .to_return(
           status: 200,
-          body: 'window.PercyDOM = { serialize: () => document.documentElement.outerHTML };',
+          body: fetch_script_string,
+          headers: {},
+        )
+
+      stub_request(:post, 'http://localhost:5338/percy/snapshot')
+        .to_return(status: 200, body: '{"success": "true" }', headers: {})
+
+      visit 'index.html'
+      data = Percy.snapshot(page, 'Name', {responsive_snapshot_capture: true})
+
+      expect(WebMock).to have_requested(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/snapshot")
+        .with(
+          body: {
+            name: 'Name',
+            url: 'http://127.0.0.1:3003/index.html',
+            dom_snapshot: [
+              {'cookies': [], 'html': dom_string, 'width': 390},
+              {'cookies': [], 'html': dom_string, 'width': 765},
+              {'cookies': [], 'html': dom_string, 'width': 1280},
+            ],
+            client_info: "percy-selenium-ruby/#{Percy::VERSION}",
+            environment_info: "selenium/#{Selenium::WebDriver::VERSION} ruby/#{RUBY_VERSION}",
+            responsive_snapshot_capture: true,
+          }.to_json,
+        ).once
+
+      expect(data).to eq(nil)
+    end
+
+    it 'sends multiple dom snapshots to the local server using selenium' do
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/healthcheck").to_return(
+        status: 200,
+        body: '{"success": "true", "widths": { "mobile": [390], "config": [765, 1280]} }',
+        headers: {
+          'x-percy-core-version': '1.0.0',
+          'config': {}, 'widths': {'mobile': [375], 'config': [765, 1280]},
+        },
+      )
+
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/dom.js")
+        .to_return(
+          status: 200,
+          body: fetch_script_string,
+          headers: {},
+        )
+
+      stub_request(:post, 'http://localhost:5338/percy/snapshot')
+        .to_return(status: 200, body: '{"success": "true" }', headers: {})
+
+      driver = Selenium::WebDriver.for :firefox
+
+      driver.navigate.to 'http://localhost:5338/test/snapshot'
+      driver.manage.add_cookie({name: 'cookie-name', value: 'cookie-value'})
+      data = Percy.snapshot(driver, 'Name', {responsive_snapshot_capture: true})
+
+      expected_cookie = {name: 'cookie-name', value: 'cookie-value', path: '/',
+                         domain: 'localhost', "expires": nil, "same_site": 'Lax',
+                         "http_only": false, "secure": false,}
+      expected_dom = '<html><head></head><body><p>Snapshot Me!</p></body></html>'
+      expect(WebMock).to have_requested(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/snapshot")
+        .with(
+          body: {
+            name: 'Name',
+            url: 'http://localhost:5338/test/snapshot',
+            dom_snapshot: [
+              {'cookies': [expected_cookie], 'html': expected_dom, 'width': 390},
+              {'cookies': [expected_cookie], 'html': expected_dom, 'width': 765},
+              {'cookies': [expected_cookie], 'html': expected_dom, 'width': 1280},
+            ],
+            client_info: "percy-selenium-ruby/#{Percy::VERSION}",
+            environment_info: "selenium/#{Selenium::WebDriver::VERSION} ruby/#{RUBY_VERSION}",
+            responsive_snapshot_capture: true,
+          }.to_json,
+        ).once
+
+      expect(data).to eq(nil)
+    end
+
+    it 'sends snapshots for sync' do
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/healthcheck")
+        .to_return(status: 200, body: '{"success": "true" }',
+                   headers: {'x-percy-core-version': '1.0.0'},)
+
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/dom.js")
+        .to_return(
+          status: 200,
+          body: fetch_script_string,
           headers: {},
         )
 
@@ -131,10 +242,10 @@ RSpec.describe Percy, type: :feature do
             name: 'Name',
             url: 'http://127.0.0.1:3003/index.html',
             dom_snapshot:
-              "<html><head><title>I am a page</title></head><body>Snapshot me\n</body></html>",
+            {'cookies' => [], 'html' => dom_string},
             client_info: "percy-selenium-ruby/#{Percy::VERSION}",
             environment_info: "selenium/#{Selenium::WebDriver::VERSION} ruby/#{RUBY_VERSION}",
-            widths: [944],
+            sync: true,
           }.to_json,
         ).once
 
