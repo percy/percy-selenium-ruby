@@ -191,20 +191,23 @@ RSpec.describe Percy, type: :feature do
 
       driver = Selenium::WebDriver.for :firefox
 
-      driver.navigate.to "http://localhost:5338/test/snapshot"
-      driver.manage.add_cookie({ name: 'cookie-name', value: 'cookie-value'})
+      driver.navigate.to 'http://localhost:5338/test/snapshot'
+      driver.manage.add_cookie({name: 'cookie-name', value: 'cookie-value'})
       data = Percy.snapshot(driver, 'Name', {responsive_snapshot_capture: true})
 
-      expected_cookie = {name: "cookie-name", value: "cookie-value", path: "/", domain: "localhost","expires": nil,"same_site": "Lax","http_only": false,"secure": false}
+      expected_cookie = {name: 'cookie-name', value: 'cookie-value', path: '/',
+                         domain: 'localhost', "expires": nil, "same_site": 'Lax',
+                         "http_only": false, "secure": false,}
+      expected_dom = '<html><head></head><body><p>Snapshot Me!</p></body></html>'
       expect(WebMock).to have_requested(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/snapshot")
         .with(
           body: {
             name: 'Name',
             url: 'http://localhost:5338/test/snapshot',
             dom_snapshot: [
-              {'cookies': [expected_cookie], 'html': '<html><head></head><body><p>Snapshot Me!</p></body></html>', 'width': 390},
-              {'cookies': [expected_cookie], 'html': '<html><head></head><body><p>Snapshot Me!</p></body></html>', 'width': 765},
-              {'cookies': [expected_cookie], 'html': '<html><head></head><body><p>Snapshot Me!</p></body></html>', 'width': 1280},
+              {'cookies': [expected_cookie], 'html': expected_dom, 'width': 390},
+              {'cookies': [expected_cookie], 'html': expected_dom, 'width': 765},
+              {'cookies': [expected_cookie], 'html': expected_dom, 'width': 1280},
             ],
             client_info: "percy-selenium-ruby/#{Percy::VERSION}",
             environment_info: "selenium/#{Selenium::WebDriver::VERSION} ruby/#{RUBY_VERSION}",
