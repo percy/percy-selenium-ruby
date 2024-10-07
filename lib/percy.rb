@@ -3,7 +3,6 @@ require 'json'
 require 'version'
 require 'net/http'
 require 'selenium-webdriver'
-require 'capybara'
 
 module Percy
   CLIENT_INFO = "percy-selenium-ruby/#{VERSION}".freeze
@@ -47,7 +46,8 @@ module Percy
   end
 
   def self.get_browser_instance(driver)
-    if driver.is_a?(Capybara::Session)
+    # this means it is a capybara session
+    if driver.respond_to?(:driver) && driver.driver.respond_to?(:browser)
       return driver.driver.browser.manage
     end
 
