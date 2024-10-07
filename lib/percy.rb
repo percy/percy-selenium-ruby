@@ -3,6 +3,7 @@ require 'json'
 require 'version'
 require 'net/http'
 require 'selenium-webdriver'
+require 'capybara'
 
 module Percy
   CLIENT_INFO = "percy-selenium-ruby/#{VERSION}".freeze
