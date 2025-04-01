@@ -261,18 +261,18 @@ RSpec.describe Percy do
 
       expect(region[:algorithm]).to eq('ignore')
       expect(region[:elementSelector]).to eq({})
-      expect(region).not_to have_key(:configuration)
-      expect(region).not_to have_key(:assertion)
+      expect(region).to_not have_key(:configuration)
+      expect(region).to_not have_key(:assertion)
     end
 
     it 'creates a region with bounding_box, xpath, and css selectors' do
       region = Percy.create_region(
-        bounding_box: { x: 10, y: 20, width: 100, height: 200 },
+        bounding_box: {x: 10, y: 20, width: 100, height: 200},
         element_xpath: '//div[@id="test"]',
-        element_css: '.test-class'
+        element_css: '.test-class',
       )
 
-      expect(region[:elementSelector][:boundingBox]).to eq({ x: 10, y: 20, width: 100, height: 200 })
+      expect(region[:elementSelector][:boundingBox]).to eq({x: 10, y: 20, width: 100, height: 200})
       expect(region[:elementSelector][:elementXpath]).to eq('//div[@id="test"]')
       expect(region[:elementSelector][:elementCSS]).to eq('.test-class')
     end
@@ -289,7 +289,7 @@ RSpec.describe Percy do
         image_ignore_threshold: 0.3,
         carousels_enabled: true,
         banners_enabled: false,
-        ads_enabled: true
+        ads_enabled: true,
       )
 
       expect(region[:configuration][:diffSensitivity]).to eq(0.5)
@@ -306,8 +306,8 @@ RSpec.describe Percy do
 
     it 'does not add empty configuration or assertion keys' do
       region = Percy.create_region(algorithm: 'ignore')
-      expect(region).not_to have_key(:configuration)
-      expect(region).not_to have_key(:assertion)
+      expect(region).to_not have_key(:configuration)
+      expect(region).to_not have_key(:assertion)
     end
   end
 end
