@@ -13,6 +13,41 @@ module Percy
   LABEL = "[\u001b[35m" + (PERCY_DEBUG ? 'percy:ruby' : 'percy') + "\u001b[39m]"
   RESONSIVE_CAPTURE_SLEEP_TIME = ENV['RESONSIVE_CAPTURE_SLEEP_TIME']
 
+  def self.create_region(
+    bounding_box: nil, element_xpath: nil, element_css: nil, padding: nil,
+    algorithm: 'ignore', diff_sensitivity: nil, image_ignore_threshold: nil,
+    carousels_enabled: nil, banners_enabled: nil, ads_enabled: nil, diff_ignore_threshold: nil
+  )
+    element_selector = {}
+    element_selector[:boundingBox] = bounding_box if bounding_box
+    element_selector[:elementXpath] = element_xpath if element_xpath
+    element_selector[:elementCSS] = element_css if element_css
+
+    region = {
+      algorithm: algorithm,
+      elementSelector: element_selector
+    }
+
+    region[:padding] = padding if padding
+
+    configuration = {}
+    if %w[standard intelliignore].include?(algorithm)
+      configuration[:diffSensitivity] = diff_sensitivity unless diff_sensitivity.nil?
+      configuration[:imageIgnoreThreshold] = image_ignore_threshold unless image_ignore_threshold.nil?
+      configuration[:carouselsEnabled] = carousels_enabled unless carousels_enabled.nil?
+      configuration[:bannersEnabled] = banners_enabled unless banners_enabled.nil?
+      configuration[:adsEnabled] = ads_enabled unless ads_enabled.nil?
+    end
+
+    region[:configuration] = configuration unless configuration.empty?
+
+    assertion = {}
+    assertion[:diffIgnoreThreshold] = diff_ignore_threshold unless diff_ignore_threshold.nil?
+    region[:assertion] = assertion unless assertion.empty?
+
+    region
+  end
+
   # Take a DOM snapshot and post it to the snapshot endpoint
   def self.snapshot(driver, name, options = {})
     return unless percy_enabled?
