@@ -25,18 +25,23 @@ module Percy
 
     region = {
       algorithm: algorithm,
-      elementSelector: element_selector
+      elementSelector: element_selector,
     }
 
     region[:padding] = padding if padding
 
     configuration = {}
     if %w[standard intelliignore].include?(algorithm)
-      configuration[:diffSensitivity] = diff_sensitivity unless diff_sensitivity.nil?
-      configuration[:imageIgnoreThreshold] = image_ignore_threshold unless image_ignore_threshold.nil?
-      configuration[:carouselsEnabled] = carousels_enabled unless carousels_enabled.nil?
-      configuration[:bannersEnabled] = banners_enabled unless banners_enabled.nil?
-      configuration[:adsEnabled] = ads_enabled unless ads_enabled.nil?
+      configuration[:diffSensitivity] =
+        diff_sensitivity unless diff_sensitivity.nil?
+      configuration[:imageIgnoreThreshold] =
+        image_ignore_threshold unless image_ignore_threshold.nil?
+      configuration[:carouselsEnabled] =
+        carousels_enabled unless carousels_enabled.nil?
+      configuration[:bannersEnabled] =
+        banners_enabled unless banners_enabled.nil?
+      configuration[:adsEnabled] =
+        ads_enabled unless ads_enabled.nil?
     end
 
     region[:configuration] = configuration unless configuration.empty?
