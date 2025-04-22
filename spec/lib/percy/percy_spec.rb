@@ -254,6 +254,64 @@ RSpec.describe Percy, type: :feature do
   end
 end
 
+RSpec.describe Percy do
+  describe '.create_region' do
+    it 'creates a region with default values' do
+      region = Percy.create_region
+
+      expect(region[:algorithm]).to eq('ignore')
+      expect(region[:elementSelector]).to eq({})
+      expect(region).to_not have_key(:configuration)
+      expect(region).to_not have_key(:assertion)
+    end
+
+    it 'creates a region with bounding_box, xpath, and css selectors' do
+      region = Percy.create_region(
+        bounding_box: {x: 10, y: 20, width: 100, height: 200},
+        element_xpath: '//div[@id="test"]',
+        element_css: '.test-class',
+      )
+
+      expect(region[:elementSelector][:boundingBox]).to eq({x: 10, y: 20, width: 100, height: 200})
+      expect(region[:elementSelector][:elementXpath]).to eq('//div[@id="test"]')
+      expect(region[:elementSelector][:elementCSS]).to eq('.test-class')
+    end
+
+    it 'creates a region with padding' do
+      region = Percy.create_region(padding: 10)
+      expect(region[:padding]).to eq(10)
+    end
+
+    it 'creates a region with configuration settings when algorithm is standard' do
+      region = Percy.create_region(
+        algorithm: 'standard',
+        diff_sensitivity: 0.5,
+        image_ignore_threshold: 0.3,
+        carousels_enabled: true,
+        banners_enabled: false,
+        ads_enabled: true,
+      )
+
+      expect(region[:configuration][:diffSensitivity]).to eq(0.5)
+      expect(region[:configuration][:imageIgnoreThreshold]).to eq(0.3)
+      expect(region[:configuration][:carouselsEnabled]).to eq(true)
+      expect(region[:configuration][:bannersEnabled]).to eq(false)
+      expect(region[:configuration][:adsEnabled]).to eq(true)
+    end
+
+    it 'creates a region with assertion settings' do
+      region = Percy.create_region(diff_ignore_threshold: 0.2)
+      expect(region[:assertion][:diffIgnoreThreshold]).to eq(0.2)
+    end
+
+    it 'does not add empty configuration or assertion keys' do
+      region = Percy.create_region(algorithm: 'ignore')
+      expect(region).to_not have_key(:configuration)
+      expect(region).to_not have_key(:assertion)
+    end
+  end
+end
+
 RSpec.describe Percy, type: :feature do
   before(:each) do
     WebMock.reset!
