@@ -30,18 +30,17 @@ module Percy
 
     region[:padding] = padding if padding
 
-    configuration = {}
     if %w[standard intelliignore].include?(algorithm)
-      configuration[:diffSensitivity] = diff_sensitivity unless diff_sensitivity.nil?
-      unless image_ignore_threshold.nil?
-        configuration[:imageIgnoreThreshold] = image_ignore_threshold
-      end
-      configuration[:carouselsEnabled] = carousels_enabled unless carousels_enabled.nil?
-      configuration[:bannersEnabled] = banners_enabled unless banners_enabled.nil?
-      configuration[:adsEnabled] = ads_enabled unless ads_enabled.nil?
-    end
+      configuration = {
+        diffSensitivity: diff_sensitivity,
+        imageIgnoreThreshold: image_ignore_threshold,
+        carouselsEnabled: carousels_enabled,
+        bannersEnabled: banners_enabled,
+        adsEnabled: ads_enabled,
+      }.compact
 
-    region[:configuration] = configuration unless configuration.empty?
+      region[:configuration] = configuration unless configuration.empty?
+    end
 
     assertion = {}
     assertion[:diffIgnoreThreshold] = diff_ignore_threshold unless diff_ignore_threshold.nil?
