@@ -12,7 +12,9 @@ module Percy
   PERCY_SERVER_ADDRESS = ENV['PERCY_SERVER_ADDRESS'] || 'http://localhost:5338'
   LABEL = "[\u001b[35m" + (PERCY_DEBUG ? 'percy:ruby' : 'percy') + "\u001b[39m]"
   RESONSIVE_CAPTURE_SLEEP_TIME = ENV['RESONSIVE_CAPTURE_SLEEP_TIME']
-
+  PERCY_RESPONSIVE_CAPTURE_RELOAD_PAGE = (ENV['PERCY_RESPONSIVE_CAPTURE_RELOAD_PAGE'] || 'false').downcase
+  PERCY_RESPONSIVE_CAPTURE_MIN_HEIGHT = (ENV['PERCY_RESPONSIVE_CAPTURE_MIN_HEIGHT'] || 'false').downcase
+  
   def self.create_region(
     bounding_box: nil, element_xpath: nil, element_css: nil, padding: nil,
     algorithm: 'ignore', diff_sensitivity: nil, image_ignore_threshold: nil,
@@ -52,6 +54,13 @@ module Percy
   # Take a DOM snapshot and post it to the snapshot endpoint
   def self.snapshot(driver, name, options = {})
     return unless percy_enabled?
+
+    if @session_type == 'automate'
+      raise StandardError, 'Invalid function call - percy_snapshot(). ' \
+        'Please use percy_screenshot() function while using Percy with Automate. ' \
+        'For more information on usage of percy_screenshot(), ' \
+        'refer https://www.browserstack.com/docs/percy/integrate/functional-and-visual'
+    end
 
     begin
       driver.execute_script(fetch_percy_dom)
@@ -112,11 +121,14 @@ module Percy
   end
 
   def self.change_window_dimension_and_wait(driver, width, height, resize_count)
+    # Log the intent
+    log("Attempting to resize window to #{width}x#{height}", 'debug')
+
     begin
       if driver.capabilities.browser_name == 'chrome' && driver.respond_to?(:execute_cdp)
         driver.execute_cdp('Emulation.setDeviceMetricsOverride', {
                              height: height, width: width, deviceScaleFactor: 1, mobile: false,
-                           },)
+                           })
       else
         get_browser_instance(driver).window.resize_to(width, height)
       end
@@ -128,6 +140,8 @@ module Percy
     begin
       wait = Selenium::WebDriver::Wait.new(timeout: 1)
       wait.until { driver.execute_script('return window.resizeCount') == resize_count }
+      actual_size = driver.execute_script("return { w: window.innerWidth, h: window.innerHeight }")
+      log("Resize successful. New Viewport Size: #{actual_size['w']}x#{actual_size['h']}", 'debug')
     rescue Selenium::WebDriver::Error::TimeoutError
       log("Timed out waiting for window resize event for width #{width}", 'debug')
     end
@@ -137,17 +151,49 @@ module Percy
     widths = get_widths_for_multi_dom(options)
     dom_snapshots = []
     window_size = get_browser_instance(driver).window.size
+    initial_viewport = driver.execute_script("return { w: window.innerWidth, h: window.innerHeight }")
+    log("Initial Window Size: #{window_size.width}x#{window_size.height} (Viewport: #{initial_viewport['w']}x#{initial_viewport['h']})", 'debug')
     current_width = window_size.width
     current_height = window_size.height
     last_window_width = current_width
     resize_count = 0
     driver.execute_script('PercyDOM.waitForResize()')
 
+    target_height = current_height
+
+    # If a minimum height is requested via env/config/options, compute a target height
+    if PERCY_RESPONSIVE_CAPTURE_MIN_HEIGHT
+      min_height = options[:minHeight] || @cli_config&.dig('snapshot', 'minHeight')
+      log("current minheight #{min_height}",'debug')
+      if min_height
+        begin
+          target_height = driver.execute_script("return window.outerHeight - window.innerHeight + #{min_height}")
+          log("Calculated height for responsive capture using minHeight: #{target_height}", 'debug')
+        rescue StandardError => e
+          log("Failed to calculate responsive target height: #{e}", 'debug')
+        end
+      end
+    end
+
     widths.each do |width|
       if last_window_width != width
         resize_count += 1
-        change_window_dimension_and_wait(driver, width, current_height, resize_count)
+        change_window_dimension_and_wait(driver, width, target_height, resize_count)
         last_window_width = width
+      end
+
+      if PERCY_RESPONSIVE_CAPTURE_RELOAD_PAGE == 'true'
+        log("Reloading page for width: #{width}", 'debug')
+        begin
+          driver.navigate.refresh
+        rescue StandardError
+          begin
+            driver.driver.browser.navigate.refresh
+          rescue StandardError => e
+            log("Failed to refresh page: #{e}", 'debug')
+          end
+        end
+        driver.execute_script(fetch_percy_dom)
       end
 
       sleep(RESONSIVE_CAPTURE_SLEEP_TIME.to_i) if defined?(RESONSIVE_CAPTURE_SLEEP_TIME)
@@ -196,6 +242,7 @@ module Percy
       response_body = JSON.parse(response.body)
       @eligible_widths = response_body['widths']
       @cli_config = response_body['config']
+      @session_type = response_body['type']
       @percy_enabled = true
       true
     rescue StandardError => e
@@ -251,10 +298,99 @@ module Percy
     response
   end
 
+  # Take a screenshot on a Percy Automate session
+  def self.percy_screenshot(driver, name, options = {})
+    return unless percy_enabled?
+
+    unless @session_type == 'automate'
+      raise StandardError, 'Invalid function call - percy_screenshot(). ' \
+        'Please use percy_snapshot() function for taking screenshot. ' \
+        'percy_screenshot() should be used only while using Percy with Automate. ' \
+        'For more information on usage of percy_snapshot(), ' \
+        'refer doc for your language https://www.browserstack.com/docs/percy/integrate/overview'
+    end
+
+    begin
+      metadata = get_driver_metadata(driver)
+
+      if options.key?(:ignoreRegionSeleniumElements)
+        options[:ignore_region_selenium_elements] = options.delete(:ignoreRegionSeleniumElements)
+      end
+      if options.key?(:considerRegionSeleniumElements)
+        options[:consider_region_selenium_elements] = options.delete(:considerRegionSeleniumElements)
+      end
+
+      ignore_region_elements = get_element_ids(options.delete(:ignore_region_selenium_elements) || [])
+      consider_region_elements = get_element_ids(options.delete(:consider_region_selenium_elements) || [])
+
+      options[:ignore_region_elements] = ignore_region_elements
+      options[:consider_region_elements] = consider_region_elements
+
+      response = fetch('percy/automateScreenshot',
+        client_info: CLIENT_INFO,
+        environment_info: ENV_INFO,
+        sessionId: metadata[:session_id],
+        commandExecutorUrl: metadata[:command_executor_url],
+        capabilities: metadata[:capabilities],
+        snapshotName: name,
+        options: options)
+
+      body = JSON.parse(response.body)
+      unless body['success']
+        raise StandardError, body['error']
+      end
+
+      body['data']
+    rescue StandardError => e
+      log("Could not take Screenshot '#{name}'")
+      log(e, 'debug')
+    end
+  end
+
+  def self.get_driver_metadata(driver)
+    session_id = driver.session_id
+
+    command_executor_url = nil
+    begin
+      url = driver.send(:bridge).http.send(:server_url)
+      command_executor_url = url.to_s unless url.nil?
+    rescue StandardError => e
+      log("Could not get command_executor_url via bridge.http.server_url: #{e}", 'debug')
+    end
+
+    if command_executor_url.nil? || command_executor_url.empty?
+      begin
+        url = driver.send(:bridge).http.instance_variable_get(:@server_url)
+        command_executor_url = url.to_s unless url.nil?
+      rescue StandardError => e
+        log("Could not get @server_url instance variable: #{e}", 'debug')
+      end
+    end
+
+    command_executor_url ||= ''
+
+    capabilities = begin
+      driver.capabilities.as_json
+    rescue StandardError
+      begin
+        driver.capabilities.to_h
+      rescue StandardError
+        {}
+      end
+    end
+
+    { session_id: session_id, command_executor_url: command_executor_url, capabilities: capabilities }
+  end
+
+  def self.get_element_ids(elements)
+    elements.map(&:id)
+  end
+
   def self._clear_cache!
     @percy_dom = nil
     @percy_enabled = nil
     @eligible_widths = nil
     @cli_config = nil
+    @session_type = nil
   end
 end
