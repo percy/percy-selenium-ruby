@@ -144,6 +144,13 @@ RSpec.describe Percy, type: :feature do
           headers: {},
         )
 
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/widths-config")
+        .to_return(
+          status: 200,
+          body: {widths: [{width: 390}, {width: 765}, {width: 1280}]}.to_json,
+          headers: {},
+        )
+
       stub_request(:post, 'http://localhost:5338/percy/snapshot')
         .to_return(status: 200, body: '{"success": "true" }', headers: {})
 
@@ -183,6 +190,13 @@ RSpec.describe Percy, type: :feature do
         .to_return(
           status: 200,
           body: fetch_script_string,
+          headers: {},
+        )
+
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/widths-config")
+        .to_return(
+          status: 200,
+          body: {widths: [{width: 390}, {width: 765}, {width: 1280}]}.to_json,
           headers: {},
         )
 
@@ -308,6 +322,366 @@ RSpec.describe Percy do
       region = Percy.create_region(algorithm: 'ignore')
       expect(region).to_not have_key(:configuration)
       expect(region).to_not have_key(:assertion)
+    end
+  end
+end
+
+RSpec.describe Percy do
+  before(:each) do
+    WebMock.disable_net_connect!
+    stub_request(:post, 'http://localhost:5338/percy/log').to_raise(StandardError)
+    Percy._clear_cache!
+  end
+
+  describe '.get_responsive_widths' do
+    it 'fetches widths from the /percy/widths-config endpoint' do
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/widths-config")
+        .to_return(status: 200, body: {widths: [{'width' => 375}, {'width' => 768}]}.to_json)
+
+      result = Percy.get_responsive_widths
+      expect(result).to eq([{'width' => 375}, {'width' => 768}])
+    end
+
+    it 'passes user-supplied widths as a query parameter' do
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/widths-config?widths=375,1280")
+        .to_return(status: 200, body: {widths: [{'width' => 375}, {'width' => 1280}]}.to_json)
+
+      result = Percy.get_responsive_widths([375, 1280])
+      expect(result).to eq([{'width' => 375}, {'width' => 1280}])
+    end
+
+    it 'omits query param when widths array is empty' do
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/widths-config")
+        .to_return(status: 200, body: {widths: [{'width' => 1280}]}.to_json)
+
+      result = Percy.get_responsive_widths([])
+      expect(result).to eq([{'width' => 1280}])
+    end
+
+    it 'raises when the response widths key is not an array' do
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/widths-config")
+        .to_return(status: 200, body: {widths: nil}.to_json)
+
+      expect { Percy.get_responsive_widths }
+        .to raise_error(StandardError, 'Update Percy CLI to the latest version to use responsiveSnapshotCapture')
+    end
+
+    it 'raises when the HTTP request fails' do
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/widths-config")
+        .to_return(status: 500, body: '')
+
+      expect { Percy.get_responsive_widths }
+        .to raise_error(StandardError, 'Update Percy CLI to the latest version to use responsiveSnapshotCapture')
+    end
+
+    it 'raises when the endpoint is unreachable' do
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/widths-config")
+        .to_raise(StandardError, 'connection refused')
+
+      expect { Percy.get_responsive_widths }
+        .to raise_error(StandardError, 'Update Percy CLI to the latest version to use responsiveSnapshotCapture')
+    end
+  end
+
+  describe '.unsupported_iframe_src?' do
+    it 'returns true for nil src' do
+      expect(Percy.unsupported_iframe_src?(nil)).to be true
+    end
+
+    it 'returns true for empty string src' do
+      expect(Percy.unsupported_iframe_src?('')).to be true
+    end
+
+    it 'returns true for about:blank' do
+      expect(Percy.unsupported_iframe_src?('about:blank')).to be true
+    end
+
+    it 'returns true for javascript: src' do
+      expect(Percy.unsupported_iframe_src?('javascript:void(0)')).to be true
+    end
+
+    it 'returns true for data: src' do
+      expect(Percy.unsupported_iframe_src?('data:text/html,<h1>Hi</h1>')).to be true
+    end
+
+    it 'returns true for vbscript: src' do
+      expect(Percy.unsupported_iframe_src?('vbscript:MsgBox()')).to be true
+    end
+
+    it 'returns false for a valid https url' do
+      expect(Percy.unsupported_iframe_src?('https://example.com/page')).to be false
+    end
+
+    it 'returns false for a relative url' do
+      expect(Percy.unsupported_iframe_src?('/embed.html')).to be false
+    end
+  end
+
+  describe '.get_origin' do
+    it 'returns scheme + host for an https url' do
+      expect(Percy.get_origin('https://example.com/path')).to eq('https://example.com')
+    end
+
+    it 'returns scheme + host for an http url' do
+      expect(Percy.get_origin('http://example.com/path')).to eq('http://example.com')
+    end
+
+    it 'omits the default http port 80' do
+      expect(Percy.get_origin('http://example.com:80/path')).to eq('http://example.com')
+    end
+
+    it 'omits the default https port 443' do
+      expect(Percy.get_origin('https://example.com:443/path')).to eq('https://example.com')
+    end
+
+    it 'includes non-default ports' do
+      expect(Percy.get_origin('http://example.com:3000/path')).to eq('http://example.com:3000')
+    end
+
+    it 'treats same host with different scheme as different origins' do
+      expect(Percy.get_origin('http://example.com')).not_to eq(Percy.get_origin('https://example.com'))
+    end
+
+    it 'treats same host with different ports as different origins' do
+      expect(Percy.get_origin('http://example.com:3000')).not_to eq(Percy.get_origin('http://example.com:4000'))
+    end
+  end
+
+  describe '.process_frame' do
+    let(:driver)        { double('driver') }
+    let(:frame_element) { double('frame_element') }
+    let(:switch_to)     { double('switch_to') }
+
+    before do
+      allow(driver).to receive(:switch_to).and_return(switch_to)
+      allow(switch_to).to receive(:frame)
+      allow(switch_to).to receive(:parent_frame)
+    end
+
+    it 'returns a hash with iframeData, iframeSnapshot, and frameUrl on success' do
+      allow(frame_element).to receive(:attribute).with('src').and_return('https://other.example.com/page')
+      allow(frame_element).to receive(:attribute).with('data-percy-element-id').and_return('elem-123')
+      allow(driver).to receive(:execute_script).and_return(nil, {'html' => '<html/>'})
+
+      result = Percy.process_frame(driver, frame_element, {}, 'percy_dom_script')
+
+      expect(result).not_to be_nil
+      expect(result['iframeData']['percyElementId']).to eq('elem-123')
+      expect(result['iframeSnapshot']).to eq({'html' => '<html/>'})
+      expect(result['frameUrl']).to eq('https://other.example.com/page')
+    end
+
+    it 'returns nil when data-percy-element-id attribute is missing' do
+      allow(frame_element).to receive(:attribute).with('src').and_return('https://other.example.com/page')
+      allow(frame_element).to receive(:attribute).with('data-percy-element-id').and_return(nil)
+      allow(driver).to receive(:execute_script).and_return(nil, {'html' => '<html/>'})
+
+      result = Percy.process_frame(driver, frame_element, {}, 'percy_dom_script')
+      expect(result).to be_nil
+    end
+
+    it 'returns nil when execute_script raises inside the iframe' do
+      allow(frame_element).to receive(:attribute).with('src').and_return('https://other.example.com/page')
+      allow(driver).to receive(:execute_script).and_raise(StandardError, 'injection error')
+
+      result = Percy.process_frame(driver, frame_element, {}, 'percy_dom_script')
+      expect(result).to be_nil
+    end
+
+    it 'returns nil when switching to the frame fails' do
+      allow(frame_element).to receive(:attribute).with('src').and_return('https://other.example.com/page')
+      allow(switch_to).to receive(:frame).and_raise(StandardError, 'no such frame')
+
+      result = Percy.process_frame(driver, frame_element, {}, 'percy_dom_script')
+      expect(result).to be_nil
+    end
+
+    it 'uses unknown-src fallback when frame has no src attribute' do
+      allow(frame_element).to receive(:attribute).with('src').and_return(nil)
+      allow(frame_element).to receive(:attribute).with('data-percy-element-id').and_return('elem-nosrc')
+      allow(driver).to receive(:execute_script).and_return(nil, {'html' => '<html/>'})
+
+      result = Percy.process_frame(driver, frame_element, {}, 'percy_dom_script')
+      expect(result['frameUrl']).to eq('unknown-src')
+    end
+
+    it 'merges enableJavaScript into the PercyDOM.serialize call' do
+      allow(frame_element).to receive(:attribute).with('src').and_return('https://other.example.com/page')
+      allow(frame_element).to receive(:attribute).with('data-percy-element-id').and_return('elem-abc')
+
+      captured_serialize_call = nil
+      call_count = 0
+      allow(driver).to receive(:execute_script) do |script|
+        call_count += 1
+        if call_count == 2
+          captured_serialize_call = script
+          {'html' => '<html/>'}
+        end
+      end
+
+      Percy.process_frame(driver, frame_element, {someOpt: 1}, 'percy_dom_script')
+
+      expect(captured_serialize_call).to include('enableJavaScript')
+      expect(captured_serialize_call).to include('true')
+    end
+
+    it 'always switches back to parent frame even when script injection fails' do
+      allow(frame_element).to receive(:attribute).with('src').and_return('https://other.example.com/page')
+      allow(driver).to receive(:execute_script).and_raise(StandardError, 'error')
+
+      Percy.process_frame(driver, frame_element, {}, 'percy_dom_script')
+
+      expect(switch_to).to have_received(:parent_frame).once
+    end
+  end
+
+  describe '.get_serialized_dom' do
+    let(:driver)    { double('driver') }
+    let(:manage)    { double('manage') }
+    let(:switch_to) { double('switch_to') }
+
+    before do
+      allow(driver).to receive(:manage).and_return(manage)
+      allow(manage).to receive(:all_cookies).and_return([])
+      allow(driver).to receive(:switch_to).and_return(switch_to)
+      allow(switch_to).to receive(:frame)
+      allow(switch_to).to receive(:parent_frame)
+    end
+
+    it 'returns the serialized dom with cookies when no iframes present' do
+      allow(driver).to receive(:execute_script).and_return({'html' => '<html/>'})
+      allow(driver).to receive(:current_url).and_return('http://main.example.com/')
+      allow(driver).to receive(:find_elements).and_return([])
+
+      dom = Percy.get_serialized_dom(driver, {})
+      expect(dom['html']).to eq('<html/>')
+      expect(dom['cookies']).to eq([])
+      expect(dom).not_to have_key('corsIframes')
+    end
+
+    it 'populates corsIframes for cross-origin frames' do
+      frame = double('frame')
+      allow(frame).to receive(:attribute).with('src').and_return('https://cross.example.com/page')
+      allow(frame).to receive(:attribute).with('data-percy-element-id').and_return('cid-1')
+
+      call_count = 0
+      allow(driver).to receive(:execute_script) do
+        call_count += 1
+        case call_count
+        when 1 then {'html' => '<main/>'}
+        when 2 then nil
+        when 3 then {'html' => '<frame/>'}
+        end
+      end
+      allow(driver).to receive(:current_url).and_return('http://main.example.com/')
+      allow(driver).to receive(:find_elements).and_return([frame])
+
+      dom = Percy.get_serialized_dom(driver, {}, percy_dom_script: 'percy_dom_script')
+
+      expect(dom).to have_key('corsIframes')
+      expect(dom['corsIframes'].length).to eq(1)
+      expect(dom['corsIframes'][0]['iframeData']['percyElementId']).to eq('cid-1')
+      expect(dom['corsIframes'][0]['iframeSnapshot']['html']).to eq('<frame/>')
+      expect(dom['corsIframes'][0]['frameUrl']).to eq('https://cross.example.com/page')
+    end
+
+    it 'skips same-origin iframes' do
+      frame = double('frame')
+      allow(frame).to receive(:attribute).with('src').and_return('http://main.example.com/inner.html')
+      allow(driver).to receive(:execute_script).and_return({'html' => '<html/>'})
+      allow(driver).to receive(:current_url).and_return('http://main.example.com/')
+      allow(driver).to receive(:find_elements).and_return([frame])
+
+      dom = Percy.get_serialized_dom(driver, {}, percy_dom_script: 'percy_dom_script')
+      expect(dom).not_to have_key('corsIframes')
+    end
+
+    it 'skips iframes with about:blank src' do
+      frame = double('frame')
+      allow(frame).to receive(:attribute).with('src').and_return('about:blank')
+      allow(driver).to receive(:execute_script).and_return({'html' => '<html/>'})
+      allow(driver).to receive(:current_url).and_return('http://main.example.com/')
+      allow(driver).to receive(:find_elements).and_return([frame])
+
+      dom = Percy.get_serialized_dom(driver, {}, percy_dom_script: 'percy_dom_script')
+      expect(dom).not_to have_key('corsIframes')
+    end
+
+    it 'does not process cross-origin iframes when percy_dom_script is nil' do
+      frame = double('frame')
+      allow(frame).to receive(:attribute).with('src').and_return('https://cross.example.com/page')
+      allow(driver).to receive(:execute_script).and_return({'html' => '<html/>'})
+      allow(driver).to receive(:current_url).and_return('http://main.example.com/')
+      allow(driver).to receive(:find_elements).and_return([frame])
+
+      dom = Percy.get_serialized_dom(driver, {}, percy_dom_script: nil)
+      expect(dom).not_to have_key('corsIframes')
+    end
+
+    it 'treats same host with different scheme as cross-origin' do
+      frame = double('frame')
+      allow(frame).to receive(:attribute).with('src').and_return('https://main.example.com/widget')
+      allow(frame).to receive(:attribute).with('data-percy-element-id').and_return('percy-id-1')
+
+      call_count = 0
+      allow(driver).to receive(:execute_script) do
+        call_count += 1
+        call_count == 1 ? {'html' => '<html/>'} : call_count == 2 ? nil : {'html' => '<frame/>'}
+      end
+      allow(driver).to receive(:current_url).and_return('http://main.example.com/')
+      allow(driver).to receive(:find_elements).and_return([frame])
+
+      dom = Percy.get_serialized_dom(driver, {}, percy_dom_script: 'script')
+      expect(dom).to have_key('corsIframes')
+    end
+
+    it 'treats same host with different port as cross-origin' do
+      frame = double('frame')
+      allow(frame).to receive(:attribute).with('src').and_return('http://main.example.com:4000/widget')
+      allow(frame).to receive(:attribute).with('data-percy-element-id').and_return('percy-id-port')
+
+      call_count = 0
+      allow(driver).to receive(:execute_script) do
+        call_count += 1
+        call_count == 1 ? {'html' => '<html/>'} : call_count == 2 ? nil : {'html' => '<frame/>'}
+      end
+      allow(driver).to receive(:current_url).and_return('http://main.example.com:3000/')
+      allow(driver).to receive(:find_elements).and_return([frame])
+
+      dom = Percy.get_serialized_dom(driver, {}, percy_dom_script: 'script')
+      expect(dom).to have_key('corsIframes')
+    end
+
+    it 'always attaches cookies to the snapshot' do
+      cookies_data = [{'name' => 'session', 'value' => 'abc'}]
+      allow(manage).to receive(:all_cookies).and_return(cookies_data)
+      allow(driver).to receive(:execute_script).and_return({'html' => '<html/>'})
+      allow(driver).to receive(:current_url).and_return('http://main.example.com/')
+      allow(driver).to receive(:find_elements).and_return([])
+
+      dom = Percy.get_serialized_dom(driver, {})
+      expect(dom['cookies']).to eq(cookies_data)
+    end
+
+    it 'skips same-origin frame and processes only cross-origin frame' do
+      same_frame = double('same_frame')
+      allow(same_frame).to receive(:attribute).with('src').and_return('http://main.example.com/inner')
+
+      cross_frame = double('cross_frame')
+      allow(cross_frame).to receive(:attribute).with('src').and_return('https://other.example.com/page')
+      allow(cross_frame).to receive(:attribute).with('data-percy-element-id').and_return('cid-x')
+
+      call_count = 0
+      allow(driver).to receive(:execute_script) do
+        call_count += 1
+        call_count == 1 ? {'html' => '<main/>'} : call_count == 2 ? nil : {'html' => '<cross/>'}
+      end
+      allow(driver).to receive(:current_url).and_return('http://main.example.com/')
+      allow(driver).to receive(:find_elements).and_return([same_frame, cross_frame])
+
+      dom = Percy.get_serialized_dom(driver, {}, percy_dom_script: 'script')
+      expect(dom['corsIframes'].length).to eq(1)
+      expect(dom['corsIframes'][0]['frameUrl']).to eq('https://other.example.com/page')
     end
   end
 end

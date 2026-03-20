@@ -41,5 +41,5 @@ RSpec.configure do |config|
   # Setup for Capybara to test Jekyll static files served by Rack
   Capybara.server_port = 3003
   Capybara.server = :puma, { Silent: true }
-  Capybara.app = Rack::File.new(File.join(File.dirname(__FILE__), 'fixture'))
+  Capybara.app = Rack::Files.new(File.join(File.dirname(__FILE__), 'fixture'))
 end
