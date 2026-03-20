@@ -13,9 +13,11 @@ module Percy
   PERCY_SERVER_ADDRESS = ENV['PERCY_SERVER_ADDRESS'] || 'http://localhost:5338'
   LABEL = "[\u001b[35m" + (PERCY_DEBUG ? 'percy:ruby' : 'percy') + "\u001b[39m]"
   RESONSIVE_CAPTURE_SLEEP_TIME = ENV['RESONSIVE_CAPTURE_SLEEP_TIME']
-  PERCY_RESPONSIVE_CAPTURE_RELOAD_PAGE = (ENV['PERCY_RESPONSIVE_CAPTURE_RELOAD_PAGE'] || 'false').downcase
-  PERCY_RESPONSIVE_CAPTURE_MIN_HEIGHT = (ENV['PERCY_RESPONSIVE_CAPTURE_MIN_HEIGHT'] || 'false').downcase
-  
+  PERCY_RESPONSIVE_CAPTURE_RELOAD_PAGE =
+    (ENV['PERCY_RESPONSIVE_CAPTURE_RELOAD_PAGE'] || 'false').downcase
+  PERCY_RESPONSIVE_CAPTURE_MIN_HEIGHT =
+    (ENV['PERCY_RESPONSIVE_CAPTURE_MIN_HEIGHT'] || 'false').downcase
+
   def self.create_region(
     bounding_box: nil, element_xpath: nil, element_css: nil, padding: nil,
     algorithm: 'ignore', diff_sensitivity: nil, image_ignore_threshold: nil,
@@ -145,7 +147,7 @@ module Percy
   def self.get_origin(url)
     uri = URI.parse(url)
     netloc = uri.host.to_s
-    default_ports = { 'http' => 80, 'https' => 443 }
+    default_ports = {'http' => 80, 'https' => 443}
     netloc += ":#{uri.port}" if uri.port && uri.port != default_ports[uri.scheme]
     "#{uri.scheme}://#{netloc}"
   end
@@ -159,7 +161,9 @@ module Percy
       begin
         driver.execute_script(percy_dom_script)
         iframe_options = options.merge('enableJavaScript' => true)
-        iframe_snapshot = driver.execute_script("return PercyDOM.serialize(#{iframe_options.to_json})")
+        iframe_snapshot = driver.execute_script(
+          "return PercyDOM.serialize(#{iframe_options.to_json})"
+        )
       rescue StandardError => e
         log("Failed to process cross-origin frame #{frame_url}: #{e}", 'debug')
       ensure
@@ -179,26 +183,29 @@ module Percy
     end
 
     {
-      'iframeData' => { 'percyElementId' => percy_element_id },
+      'iframeData' => {'percyElementId' => percy_element_id},
       'iframeSnapshot' => iframe_snapshot,
-      'frameUrl' => frame_url
+      'frameUrl' => frame_url,
     }
   end
 
   def self.get_responsive_widths(widths = [])
     begin
       widths_list = widths.is_a?(Array) ? widths : []
-      query_param = widths_list.any? ? "?widths=#{widths_list.join(',')}": ''
+      query_param = widths_list.any? ? "?widths=#{widths_list.join(',')}" : ''
       response = fetch("percy/widths-config#{query_param}")
       data = JSON.parse(response.body)
       widths_data = data['widths']
       unless widths_data.is_a?(Array)
-        raise StandardError, 'Update Percy CLI to the latest version to use responsiveSnapshotCapture'
+        raise StandardError,
+              'Update Percy CLI to the latest version to use responsiveSnapshotCapture'
       end
+
       widths_data
     rescue StandardError => e
       log("Failed to get responsive widths: #{e}.", 'debug')
-      raise StandardError, 'Update Percy CLI to the latest version to use responsiveSnapshotCapture'
+      raise StandardError,
+            'Update Percy CLI to the latest version to use responsiveSnapshotCapture'
     end
   end
 
@@ -210,25 +217,24 @@ module Percy
       if driver.capabilities.browser_name == 'chrome' && driver.respond_to?(:execute_cdp)
         driver.execute_cdp('Emulation.setDeviceMetricsOverride', {
                              height: height, width: width, deviceScaleFactor: 1, mobile: false,
-                           })
+                           },)
       else
-        
         get_browser_instance(driver).window.resize_to(width, height)
-        sleep(0.5)         
+        sleep(0.5)
         # 3. FORCE the event to fire so PercyDOM and page listeners react
-        driver.execute_script("window.dispatchEvent(new Event('resize'));")
+        driver.execute_script('window.dispatchEvent(new Event(\'resize\'));')
       end
     rescue StandardError => e
       log("Resizing using cdp failed, falling back to driver for width #{width} #{e}", 'debug')
       get_browser_instance(driver).window.resize_to(width, height)
       sleep(0.5)
-      driver.execute_script("window.dispatchEvent(new Event('resize'));")
+      driver.execute_script('window.dispatchEvent(new Event(\'resize\'));')
     end
 
     begin
       wait = Selenium::WebDriver::Wait.new(timeout: 1)
       wait.until { driver.execute_script('return window.resizeCount') == resize_count }
-      actual_size = driver.execute_script("return { w: window.innerWidth, h: window.innerHeight }")
+      actual_size = driver.execute_script('return { w: window.innerWidth, h: window.innerHeight }')
       log("Resize successful. New Viewport Size: #{actual_size['w']}x#{actual_size['h']}", 'debug')
     rescue Selenium::WebDriver::Error::TimeoutError
       log("Timed out waiting for window resize event for width #{width}", 'debug')
@@ -240,8 +246,14 @@ module Percy
     log(widths.to_s, 'debug')
     dom_snapshots = []
     window_size = get_browser_instance(driver).window.size
-    initial_viewport = driver.execute_script("return { w: window.innerWidth, h: window.innerHeight }")
-    log("Initial Window Size: #{window_size.width}x#{window_size.height} (Viewport: #{initial_viewport['w']}x#{initial_viewport['h']})", 'debug')
+    initial_viewport = driver.execute_script(
+      'return { w: window.innerWidth, h: window.innerHeight }'
+    )
+    log(
+      "Initial Window Size: #{window_size.width}x#{window_size.height} " \
+      "(Viewport: #{initial_viewport['w']}x#{initial_viewport['h']})",
+      'debug'
+    )
     current_width = window_size.width
     current_height = window_size.height
     last_window_width = current_width
@@ -256,7 +268,9 @@ module Percy
       log("current minheight #{min_height}", 'debug')
       if min_height
         begin
-          target_height = driver.execute_script("return window.outerHeight - window.innerHeight + #{min_height}")
+          target_height = driver.execute_script(
+            "return window.outerHeight - window.innerHeight + #{min_height}"
+          )
           log("Calculated height for responsive capture using minHeight: #{target_height}", 'debug')
         rescue StandardError => e
           log("Failed to calculate responsive target height: #{e}", 'debug')
@@ -412,11 +426,14 @@ module Percy
         options[:ignore_region_selenium_elements] = options.delete(:ignoreRegionSeleniumElements)
       end
       if options.key?(:considerRegionSeleniumElements)
-        options[:consider_region_selenium_elements] = options.delete(:considerRegionSeleniumElements)
+        options[:consider_region_selenium_elements] =
+          options.delete(:considerRegionSeleniumElements)
       end
 
-      ignore_region_elements = get_element_ids(options.delete(:ignore_region_selenium_elements) || [])
-      consider_region_elements = get_element_ids(options.delete(:consider_region_selenium_elements) || [])
+      ignore_region_elements =
+        get_element_ids(options.delete(:ignore_region_selenium_elements) || [])
+      consider_region_elements =
+        get_element_ids(options.delete(:consider_region_selenium_elements) || [])
 
       options[:ignore_region_elements] = ignore_region_elements
       options[:consider_region_elements] = consider_region_elements
@@ -428,7 +445,7 @@ module Percy
         commandExecutorUrl: metadata.command_executor_url,
         capabilities: metadata.capabilities,
         snapshotName: name,
-        options: options)
+        options: options,)
 
       body = JSON.parse(response.body)
       unless body['success']
