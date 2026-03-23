@@ -1,13 +1,17 @@
 require 'spec_helper'
 
+# rubocop:disable RSpec/FilePath
 RSpec.describe DriverMetaData do
   let(:session_id) { 'session_id_123' }
   let(:url) { 'http://hub:4444/wd/hub' }
-  let(:caps_hash) { { 'browser' => 'chrome', 'platform' => 'windows', 'browserVersion' => '115.0.1' } }
+  let(:caps_hash) do
+    {'browser' => 'chrome', 'platform' => 'windows', 'browserVersion' => '115.0.1'}
+  end
 
   before(:each) do
     Cache.clear_cache!
-    stub_request(:post, 'http://localhost:5338/percy/log').to_return(status: 200, body: '', headers: {})
+    stub_request(:post, 'http://localhost:5338/percy/log')
+      .to_return(status: 200, body: '', headers: {})
   end
 
   describe '#session_id' do
@@ -28,7 +32,7 @@ RSpec.describe DriverMetaData do
     end
 
     context 'when bridge.http.server_url succeeds' do
-      before do
+      before(:each) do
         allow(http_double).to receive(:server_url).and_return(URI(url))
       end
 
@@ -38,18 +42,19 @@ RSpec.describe DriverMetaData do
       end
 
       it 'caches the url and returns it on subsequent calls without re-fetching' do
+        expect(mock_driver).to receive(:bridge).once.and_return(bridge_double)
         metadata = DriverMetaData.new(mock_driver)
         metadata.command_executor_url
         metadata.command_executor_url
-        expect(mock_driver).to have_received(:bridge).once
         expect(Cache.get_cache(session_id, Cache::COMMAND_EXECUTOR_URL)).to eq(url)
       end
     end
 
     context 'when bridge.http.server_url raises but @server_url ivar succeeds' do
-      before do
+      before(:each) do
         allow(http_double).to receive(:server_url).and_raise(StandardError, 'server_url failed')
-        allow(http_double).to receive(:instance_variable_get).with(:@server_url).and_return(URI(url))
+        allow(http_double).to receive(:instance_variable_get)
+          .with(:@server_url).and_return(URI(url))
       end
 
       it 'falls back to @server_url instance variable and returns the url' do
@@ -59,9 +64,10 @@ RSpec.describe DriverMetaData do
     end
 
     context 'when both server_url and @server_url ivar raise' do
-      before do
+      before(:each) do
         allow(http_double).to receive(:server_url).and_raise(StandardError)
-        allow(http_double).to receive(:instance_variable_get).with(:@server_url).and_raise(StandardError)
+        allow(http_double).to receive(:instance_variable_get)
+          .with(:@server_url).and_raise(StandardError)
       end
 
       it 'returns an empty string' do
@@ -89,7 +95,7 @@ RSpec.describe DriverMetaData do
     let(:mock_driver) { double('WebDriver', session_id: session_id, capabilities: caps_double) }
 
     context 'when as_json succeeds' do
-      before { allow(caps_double).to receive(:as_json).and_return(caps_hash) }
+      before(:each) { allow(caps_double).to receive(:as_json).and_return(caps_hash) }
 
       it 'returns capabilities as json' do
         metadata = DriverMetaData.new(mock_driver)
@@ -97,16 +103,16 @@ RSpec.describe DriverMetaData do
       end
 
       it 'caches capabilities and returns them on subsequent calls without re-fetching' do
+        expect(caps_double).to receive(:as_json).once.and_return(caps_hash)
         metadata = DriverMetaData.new(mock_driver)
         metadata.capabilities
         metadata.capabilities
-        expect(caps_double).to have_received(:as_json).once
         expect(Cache.get_cache(session_id, Cache::CAPABILITIES)).to eq(caps_hash)
       end
     end
 
     context 'when as_json raises but to_h succeeds' do
-      before do
+      before(:each) do
         allow(caps_double).to receive(:as_json).and_raise(StandardError)
         allow(caps_double).to receive(:to_h).and_return(caps_hash)
       end
@@ -118,7 +124,7 @@ RSpec.describe DriverMetaData do
     end
 
     context 'when both as_json and to_h raise' do
-      before do
+      before(:each) do
         allow(caps_double).to receive(:as_json).and_raise(StandardError)
         allow(caps_double).to receive(:to_h).and_raise(StandardError)
       end
@@ -130,3 +136,4 @@ RSpec.describe DriverMetaData do
     end
   end
 end
+# rubocop:enable RSpec/FilePath

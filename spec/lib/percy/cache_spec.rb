@@ -3,7 +3,7 @@ require 'spec_helper'
 RSpec.describe Cache do
   let(:session_id) { 'session_id_123' }
   let(:url) { 'https://example-hub:4444/wd/hub' }
-  let(:caps) { { 'browser' => 'chrome', 'platform' => 'windows', 'browserVersion' => '115.0.1' } }
+  let(:caps) { {'browser' => 'chrome', 'platform' => 'windows', 'browserVersion' => '115.0.1'} }
 
   before(:each) { Cache.clear_cache! }
 
@@ -19,7 +19,7 @@ RSpec.describe Cache do
     end
 
     it 'does not raise when both arguments are strings' do
-      expect { Cache.check_types(session_id, Cache::COMMAND_EXECUTOR_URL) }.not_to raise_error
+      expect { Cache.check_types(session_id, Cache::COMMAND_EXECUTOR_URL) }.to_not raise_error
     end
   end
 
@@ -54,7 +54,7 @@ RSpec.describe Cache do
   end
 
   describe '.get_cache' do
-    before do
+    before(:each) do
       Cache.set_cache(session_id, Cache::COMMAND_EXECUTOR_URL, url)
       Cache.set_cache(session_id, Cache::CAPABILITIES, caps)
     end
@@ -96,7 +96,7 @@ RSpec.describe Cache do
       Cache.set_cache(session_id, Cache::COMMAND_EXECUTOR_URL, url)
       Cache::CACHE[session_id][Cache::TIMEOUT_KEY] = Time.now.to_f - (Cache::CACHE_TIMEOUT + 1)
       Cache.cleanup_cache
-      expect(Cache::CACHE).not_to have_key(session_id)
+      expect(Cache::CACHE).to_not have_key(session_id)
     end
 
     it 'keeps entries that have not exceeded the cache timeout' do
@@ -112,7 +112,7 @@ RSpec.describe Cache do
       Cache::CACHE[expired_session][Cache::TIMEOUT_KEY] = Time.now.to_f - (Cache::CACHE_TIMEOUT + 1)
       Cache.cleanup_cache
       expect(Cache::CACHE).to have_key(session_id)
-      expect(Cache::CACHE).not_to have_key(expired_session)
+      expect(Cache::CACHE).to_not have_key(expired_session)
     end
   end
 
