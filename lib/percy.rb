@@ -345,7 +345,6 @@ module Percy
       end
 
       response_body = JSON.parse(response.body)
-      @eligible_widths = response_body['widths']
       @cli_config = response_body['config']
       @session_type = response_body['type']
       @percy_enabled = true
