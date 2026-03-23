@@ -731,4 +731,297 @@ RSpec.describe Percy, type: :feature do
     end
   end
 end
+
+RSpec.describe Percy do
+  describe '.percy_screenshot' do
+    let(:driver) { double('driver') }
+    let(:metadata) do
+      instance_double(
+        DriverMetaData,
+        session_id: 'sess-abc-123',
+        command_executor_url: 'http://hub.browserstack.com/wd/hub',
+        capabilities: {'browserName' => 'chrome', 'version' => '114'},
+      )
+    end
+
+    let(:automate_url) { "#{Percy::PERCY_SERVER_ADDRESS}/percy/automateScreenshot" }
+
+    before(:each) do
+      WebMock.disable_net_connect!
+      stub_request(:post, 'http://localhost:5338/percy/log').to_raise(StandardError)
+      Percy._clear_cache!
+      allow(Percy).to receive(:get_driver_metadata).with(driver).and_return(metadata)
+    end
+
+    def stub_automate_healthcheck
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/healthcheck")
+        .to_return(
+          status: 200,
+          body: '{"success":true,"type":"automate"}',
+          headers: {'x-percy-core-version': '1.0.0'},
+        )
+    end
+
+    def stub_web_healthcheck
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/healthcheck")
+        .to_return(
+          status: 200,
+          body: '{"success":true,"type":"web"}',
+          headers: {'x-percy-core-version': '1.0.0'},
+        )
+    end
+
+    # -------------------------------------------------------------------------
+    # percy_enabled? gating
+    # -------------------------------------------------------------------------
+
+    it 'returns nil without posting when percy is not running' do
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/healthcheck")
+        .to_return(status: 500, body: '')
+
+      result = nil
+      expect { result = Percy.percy_screenshot(driver, 'DisabledShot') }
+        .to output(/Percy is not running/).to_stdout
+      expect(result).to be_nil
+      expect(WebMock).to_not have_requested(:post, /automateScreenshot/)
+    end
+
+    it 'returns nil without posting when healthcheck raises a connection error' do
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/healthcheck")
+        .to_raise(StandardError, 'connection refused')
+
+      result = nil
+      expect { result = Percy.percy_screenshot(driver, 'ConnErrShot') }
+        .to output(/Percy is not running/).to_stdout
+      expect(result).to be_nil
+    end
+
+    # -------------------------------------------------------------------------
+    # Session-type enforcement
+    # -------------------------------------------------------------------------
+
+    it 'raises with a descriptive message when session type is not automate' do
+      stub_web_healthcheck
+
+      expect { Percy.percy_screenshot(driver, 'WebShot') }
+        .to raise_error(
+          StandardError,
+          /Invalid function call - percy_screenshot\(\)/,
+        )
+    end
+
+    it 'error message for wrong session type includes guidance to use percy_snapshot' do
+      stub_web_healthcheck
+
+      expect { Percy.percy_screenshot(driver, 'WebShot') }
+        .to raise_error(StandardError, /percy_snapshot\(\)/)
+    end
+
+    it 'does not raise when session type is automate' do
+      stub_automate_healthcheck
+      stub_request(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/automateScreenshot")
+        .to_return(status: 200, body: '{"success":true}')
+
+      expect { Percy.percy_screenshot(driver, 'AutoShot') }.to_not raise_error
+    end
+
+    # -------------------------------------------------------------------------
+    # Request payload construction
+    # -------------------------------------------------------------------------
+
+    it 'posts to percy/automateScreenshot with correct top-level fields' do
+      stub_automate_healthcheck
+      stub_request(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/automateScreenshot")
+        .to_return(status: 200, body: '{"success":true,"data":"snap-result"}')
+
+      Percy.percy_screenshot(driver, 'PayloadShot')
+
+      expect(WebMock).to have_requested(:post, automate_url)
+        .with { |req|
+          body = JSON.parse(req.body)
+          body['snapshotName'] == 'PayloadShot' &&
+            body['sessionId'] == 'sess-abc-123' &&
+            body['commandExecutorUrl'] == 'http://hub.browserstack.com/wd/hub' &&
+            body['capabilities'] == {'browserName' => 'chrome', 'version' => '114'} &&
+            body['client_info'] == "percy-selenium-ruby/#{Percy::VERSION}" &&
+            body['environment_info'] ==
+              "selenium/#{Selenium::WebDriver::VERSION} ruby/#{RUBY_VERSION}"
+        }.once
+    end
+
+    # -------------------------------------------------------------------------
+    # Response handling - success
+    # -------------------------------------------------------------------------
+
+    it 'returns body["data"] when the response indicates success' do
+      stub_automate_healthcheck
+      stub_request(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/automateScreenshot")
+        .to_return(status: 200, body: '{"success":true,"data":"my-screenshot-data"}')
+
+      result = Percy.percy_screenshot(driver, 'SuccessShot')
+      expect(result).to eq('my-screenshot-data')
+    end
+
+    it 'returns nil when data key is absent in a successful response' do
+      stub_automate_healthcheck
+      stub_request(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/automateScreenshot")
+        .to_return(status: 200, body: '{"success":true}')
+
+      result = Percy.percy_screenshot(driver, 'NoDataShot')
+      expect(result).to be_nil
+    end
+
+    # -------------------------------------------------------------------------
+    # Response handling - errors
+    # -------------------------------------------------------------------------
+
+    it 'logs and returns nil when response success is false' do
+      stub_automate_healthcheck
+      stub_request(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/automateScreenshot")
+        .to_return(status: 200, body: '{"success":false,"error":"upstream failure"}')
+
+      result = nil
+      expect { result = Percy.percy_screenshot(driver, 'FailShot') }
+        .to output("#{Percy::LABEL} Could not take Screenshot 'FailShot'\n").to_stdout
+      expect(result).to be_nil
+    end
+
+    it 'logs and returns nil when the HTTP request returns a non-success status' do
+      stub_automate_healthcheck
+      stub_request(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/automateScreenshot")
+        .to_return(status: 500, body: 'Internal Server Error')
+
+      result = nil
+      expect { result = Percy.percy_screenshot(driver, 'HttpErrShot') }
+        .to output("#{Percy::LABEL} Could not take Screenshot 'HttpErrShot'\n").to_stdout
+      expect(result).to be_nil
+    end
+
+    it 'logs and returns nil when the automateScreenshot endpoint raises' do
+      stub_automate_healthcheck
+      stub_request(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/automateScreenshot")
+        .to_raise(StandardError, 'network timeout')
+
+      result = nil
+      expect { result = Percy.percy_screenshot(driver, 'RaiseShot') }
+        .to output("#{Percy::LABEL} Could not take Screenshot 'RaiseShot'\n").to_stdout
+      expect(result).to be_nil
+    end
+
+    # -------------------------------------------------------------------------
+    # Option key translation
+    # -------------------------------------------------------------------------
+
+    it 'translates camelCase ignoreRegionSeleniumElements to snake_case and extracts ids' do
+      stub_automate_healthcheck
+      elem1 = double('element1', id: 'elem-id-1')
+      elem2 = double('element2', id: 'elem-id-2')
+
+      stub_request(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/automateScreenshot")
+        .to_return(status: 200, body: '{"success":true}')
+
+      Percy.percy_screenshot(driver, 'IgnoreShot', ignoreRegionSeleniumElements: [elem1, elem2])
+
+      expect(WebMock).to have_requested(:post, automate_url)
+        .with { |req|
+          opts = JSON.parse(req.body)['options']
+          opts['ignore_region_elements'] == %w[elem-id-1 elem-id-2] &&
+            !opts.key?('ignoreRegionSeleniumElements') &&
+            !opts.key?('ignore_region_selenium_elements')
+        }.once
+    end
+
+    it 'translates camelCase considerRegionSeleniumElements to snake_case and extracts ids' do
+      stub_automate_healthcheck
+      elem = double('element', id: 'consider-id-1')
+
+      stub_request(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/automateScreenshot")
+        .to_return(status: 200, body: '{"success":true}')
+
+      Percy.percy_screenshot(driver, 'ConsiderShot', considerRegionSeleniumElements: [elem])
+
+      expect(WebMock).to have_requested(:post, automate_url)
+        .with { |req|
+          opts = JSON.parse(req.body)['options']
+          opts['consider_region_elements'] == ['consider-id-1'] &&
+            !opts.key?('considerRegionSeleniumElements') &&
+            !opts.key?('consider_region_selenium_elements')
+        }.once
+    end
+
+    it 'also accepts already-snake_case ignore_region_selenium_elements' do
+      stub_automate_healthcheck
+      elem = double('element', id: 'snake-id-1')
+
+      stub_request(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/automateScreenshot")
+        .to_return(status: 200, body: '{"success":true}')
+
+      Percy.percy_screenshot(driver, 'SnakeShot', ignore_region_selenium_elements: [elem])
+
+      expect(WebMock).to have_requested(:post, automate_url)
+        .with { |req|
+          opts = JSON.parse(req.body)['options']
+          opts['ignore_region_elements'] == ['snake-id-1']
+        }.once
+    end
+
+    # -------------------------------------------------------------------------
+    # Element ID extraction
+    # -------------------------------------------------------------------------
+
+    it 'uses empty arrays for element ids when no element options are supplied' do
+      stub_automate_healthcheck
+      stub_request(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/automateScreenshot")
+        .to_return(status: 200, body: '{"success":true}')
+
+      Percy.percy_screenshot(driver, 'NoElemsShot')
+
+      expect(WebMock).to have_requested(:post, automate_url)
+        .with { |req|
+          opts = JSON.parse(req.body)['options']
+          opts['ignore_region_elements'] == [] &&
+            opts['consider_region_elements'] == []
+        }.once
+    end
+
+    it 'extracts the id from each selenium element object' do
+      stub_automate_healthcheck
+      elements = [
+        double('el_a', id: 'id-a'),
+        double('el_b', id: 'id-b'),
+        double('el_c', id: 'id-c'),
+      ]
+
+      stub_request(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/automateScreenshot")
+        .to_return(status: 200, body: '{"success":true}')
+
+      Percy.percy_screenshot(driver, 'MultiElemShot',
+        ignore_region_selenium_elements: elements,)
+
+      expect(WebMock).to have_requested(:post, automate_url)
+        .with { |req|
+          opts = JSON.parse(req.body)['options']
+          opts['ignore_region_elements'] == %w[id-a id-b id-c]
+        }.once
+    end
+
+    # -------------------------------------------------------------------------
+    # Passthrough of additional options
+    # -------------------------------------------------------------------------
+
+    it 'passes unknown options through to the request payload unchanged' do
+      stub_automate_healthcheck
+      stub_request(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/automateScreenshot")
+        .to_return(status: 200, body: '{"success":true}')
+
+      Percy.percy_screenshot(driver, 'ExtraOptsShot', sync: true, fullPage: true)
+
+      expect(WebMock).to have_requested(:post, automate_url)
+        .with { |req|
+          opts = JSON.parse(req.body)['options']
+          opts['sync'] == true && opts['fullPage'] == true
+        }.once
+    end
+  end
+end
 # rubocop:enable RSpec/MultipleDescribes
