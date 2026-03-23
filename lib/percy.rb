@@ -260,7 +260,7 @@ module Percy
     target_height = current_height
 
     # If a minimum height is requested via env/config/options, compute a target height
-    if PERCY_RESPONSIVE_CAPTURE_MIN_HEIGHT
+    if PERCY_RESPONSIVE_CAPTURE_MIN_HEIGHT == 'true'
       min_height = options[:minHeight] || @cli_config&.dig('snapshot', 'minHeight')
       log("current minheight #{min_height}", 'debug')
       if min_height
