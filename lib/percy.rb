@@ -253,16 +253,7 @@ module Percy
 
     # If a minimum height is requested via env/config/options, compute a target height
     if PERCY_RESPONSIVE_CAPTURE_MIN_HEIGHT == 'true'
-      min_height = options[:minHeight] || @cli_config&.dig('snapshot', 'minHeight')
-      if min_height
-        begin
-          target_height =
-            driver.execute_script("return #{min_height}")
-          log("Calculated height for responsive capture using minHeight: #{target_height}", 'debug')
-        rescue StandardError => e
-          log("Failed to calculate responsive target height: #{e}", 'debug')
-        end
-      end
+      target_height = options[:minHeight] || @cli_config&.dig('snapshot', 'minHeight')
     end
 
     widths.each do |width_dict|
