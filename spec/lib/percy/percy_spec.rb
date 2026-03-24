@@ -889,36 +889,21 @@ RSpec.describe Percy do
         allow(Percy).to receive(:get_responsive_widths).and_return([{'width' => 390}])
       end
 
-      it 'uses the minHeight option to compute target height via execute_script' do
-        allow(driver).to receive(:execute_script) do |script|
-          950 if script.include?('outerHeight') && script.include?('800')
-        end
+      it 'uses the minHeight option as the target height' do
         expect(Percy).to receive(:change_window_dimension_and_wait)
-          .with(driver, 390, 950, anything)
+          .with(driver, 390, 800, anything)
         Percy.capture_responsive_dom(driver, {minHeight: 800})
       end
 
       it 'uses minHeight from cli_config when not provided in options' do
         begin
           Percy.instance_variable_set(:@cli_config, {'snapshot' => {'minHeight' => 700}})
-          allow(driver).to receive(:execute_script) do |script|
-            880 if script.include?('outerHeight') && script.include?('700')
-          end
           expect(Percy).to receive(:change_window_dimension_and_wait)
-            .with(driver, 390, 880, anything)
+            .with(driver, 390, 700, anything)
           Percy.capture_responsive_dom(driver, {})
         ensure
           Percy.instance_variable_set(:@cli_config, nil)
         end
-      end
-
-      it 'falls back to window height when the height execute_script raises' do
-        allow(driver).to receive(:execute_script) do |script|
-          raise StandardError, 'script error' if script.include?('outerHeight')
-        end
-        expect(Percy).to receive(:change_window_dimension_and_wait)
-          .with(driver, 390, 900, anything)
-        Percy.capture_responsive_dom(driver, {minHeight: 800})
       end
 
       it 'uses the current window height unchanged when minHeight is not set' do

@@ -12,7 +12,7 @@ module Percy
   PERCY_DEBUG = ENV['PERCY_LOGLEVEL'] == 'debug'
   PERCY_SERVER_ADDRESS = ENV['PERCY_SERVER_ADDRESS'] || 'http://localhost:5338'
   LABEL = "[\u001b[35m" + (PERCY_DEBUG ? 'percy:ruby' : 'percy') + "\u001b[39m]"
-  RESONSIVE_CAPTURE_SLEEP_TIME = ENV['RESONSIVE_CAPTURE_SLEEP_TIME']
+  RESPONSIVE_CAPTURE_SLEEP_TIME = ENV['RESPONSIVE_CAPTURE_SLEEP_TIME']
   PERCY_RESPONSIVE_CAPTURE_RELOAD_PAGE =
     (ENV['PERCY_RESPONSIVE_CAPTURE_RELOAD_PAGE'] || 'false').downcase
   PERCY_RESPONSIVE_CAPTURE_MIN_HEIGHT =
@@ -82,11 +82,11 @@ module Percy
         environment_info: ENV_INFO,
         **options,)
 
-      unless response.body.to_json['success']
-        raise StandardError, data['error']
+      body = JSON.parse(response.body)
+      unless body['success']
+        raise StandardError, body['error']
       end
 
-      body = JSON.parse(response.body)
       body['data']
     rescue StandardError => e
       log("Could not take DOM snapshot '#{name}'")
@@ -249,9 +249,9 @@ module Percy
     driver.execute_script('PercyDOM.waitForResize()')
     target_height = current_height
 
-    # If a minimum height is requested via env/config/options, compute a target height
     if PERCY_RESPONSIVE_CAPTURE_MIN_HEIGHT == 'true'
-      target_height = options[:minHeight] || @cli_config&.dig('snapshot', 'minHeight')
+      min = options[:minHeight] || @cli_config&.dig('snapshot', 'minHeight')
+      target_height = min if min
     end
 
     widths.each do |width_dict|
@@ -282,7 +282,7 @@ module Percy
         resize_count = 0
       end
 
-      sleep(RESONSIVE_CAPTURE_SLEEP_TIME.to_i) if defined?(RESONSIVE_CAPTURE_SLEEP_TIME)
+      sleep(RESPONSIVE_CAPTURE_SLEEP_TIME.to_i) if RESPONSIVE_CAPTURE_SLEEP_TIME
 
       dom_snapshot = get_serialized_dom(driver, options, percy_dom_script: percy_dom_script)
       dom_snapshot['width'] = width
