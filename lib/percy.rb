@@ -241,8 +241,6 @@ module Percy
     widths = get_responsive_widths(options[:widths] || [])
     dom_snapshots = []
     window_size = get_browser_instance(driver).window.size
-    initial_viewport =
-    driver.execute_script('return { w: window.innerWidth, h: window.innerHeight }')
     current_width = window_size.width
     current_height = window_size.height
     last_window_width = current_width
