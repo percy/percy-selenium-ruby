@@ -703,6 +703,231 @@ RSpec.describe Percy do
       expect(dom['corsIframes'][0]['frameUrl']).to eq('https://other.example.com/page')
     end
   end
+
+  describe '.change_window_dimension_and_wait' do
+    let(:driver)        { double('driver') }
+    let(:manage)        { double('manage') }
+    let(:window)        { double('window') }
+    let(:wait)          { instance_double(Selenium::WebDriver::Wait) }
+    let(:caps_firefox)  { double('capabilities', browser_name: 'firefox') }
+
+    before(:each) do
+      allow(driver).to receive(:manage).and_return(manage)
+      allow(manage).to receive(:window).and_return(window)
+      allow(window).to receive(:resize_to)
+      allow(driver).to receive(:capabilities).and_return(caps_firefox)
+      allow(driver).to receive(:respond_to?).with(:driver).and_return(false)
+      allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(false)
+      allow(driver).to receive(:execute_script) do |script|
+        {'w' => 1024, 'h' => 768} if script.include?('innerWidth')
+      end
+      allow(Selenium::WebDriver::Wait).to receive(:new).and_return(wait)
+      allow(wait).to receive(:until)
+      allow(Percy).to receive(:log)
+    end
+
+    it 'resizes the window using resize_to for non-chrome browsers' do
+      expect(window).to receive(:resize_to).with(768, 1024)
+      Percy.change_window_dimension_and_wait(driver, 768, 1024, 1)
+    end
+
+    it 'dispatches a resize event after resizing for non-chrome browsers' do
+      expect(driver).to receive(:execute_script)
+        .with("window.dispatchEvent(new Event('resize'));")
+      Percy.change_window_dimension_and_wait(driver, 768, 1024, 1)
+    end
+
+    it 'uses execute_cdp for chrome when execute_cdp is available' do
+      chrome_caps = double('capabilities', browser_name: 'chrome')
+      allow(driver).to receive(:capabilities).and_return(chrome_caps)
+      allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(true)
+      expect(driver).to receive(:execute_cdp).with(
+        'Emulation.setDeviceMetricsOverride',
+        {height: 812, width: 375, deviceScaleFactor: 1, mobile: false},
+      )
+      Percy.change_window_dimension_and_wait(driver, 375, 812, 1)
+    end
+
+    it 'does not call resize_to when cdp succeeds for chrome' do
+      chrome_caps = double('capabilities', browser_name: 'chrome')
+      allow(driver).to receive(:capabilities).and_return(chrome_caps)
+      allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(true)
+      allow(driver).to receive(:execute_cdp)
+      expect(window).to_not receive(:resize_to)
+      Percy.change_window_dimension_and_wait(driver, 375, 812, 1)
+    end
+
+    it 'falls back to resize_to when execute_cdp raises' do
+      chrome_caps = double('capabilities', browser_name: 'chrome')
+      allow(driver).to receive(:capabilities).and_return(chrome_caps)
+      allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(true)
+      allow(driver).to receive(:execute_cdp).and_raise(StandardError, 'cdp error')
+      expect(window).to receive(:resize_to).with(375, 812)
+      Percy.change_window_dimension_and_wait(driver, 375, 812, 1)
+    end
+
+    it 'dispatches a resize event in the cdp fallback path' do
+      chrome_caps = double('capabilities', browser_name: 'chrome')
+      allow(driver).to receive(:capabilities).and_return(chrome_caps)
+      allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(true)
+      allow(driver).to receive(:execute_cdp).and_raise(StandardError, 'cdp error')
+      expect(driver).to receive(:execute_script)
+        .with("window.dispatchEvent(new Event('resize'));")
+      Percy.change_window_dimension_and_wait(driver, 375, 812, 1)
+    end
+  end
+
+  describe '.capture_responsive_dom' do
+    let(:driver)   { double('driver') }
+    let(:manage)   { double('manage') }
+    let(:window)   { double('window') }
+    let(:size)     { double('size', width: 1280, height: 900) }
+    let(:navigate) { double('navigate') }
+
+    before(:each) do
+      allow(driver).to receive(:manage).and_return(manage)
+      allow(manage).to receive(:window).and_return(window)
+      allow(window).to receive(:size).and_return(size)
+      allow(driver).to receive(:respond_to?).with(:driver).and_return(false)
+      allow(driver).to receive(:execute_script).and_return(nil)
+      allow(Percy).to receive(:get_serialized_dom).and_return({'html' => '<html/>'})
+      allow(Percy).to receive(:change_window_dimension_and_wait)
+      allow(Percy).to receive(:log)
+    end
+
+    # -----------------------------------------------------------------------
+    # Resize behavior
+    # -----------------------------------------------------------------------
+
+    it 'calls change_window_dimension_and_wait for each distinct width' do
+      allow(Percy).to receive(:get_responsive_widths).and_return(
+        [{'width' => 375}, {'width' => 768}, {'width' => 1280}],
+      )
+      # Each of the 3 widths differs from the previous + final restore = 4 calls
+      expect(Percy).to receive(:change_window_dimension_and_wait).exactly(4).times
+      Percy.capture_responsive_dom(driver, {})
+    end
+
+    it 'skips resize when consecutive entries have the same width and height' do
+      allow(Percy).to receive(:get_responsive_widths).and_return(
+        [{'width' => 375}, {'width' => 375}],
+      )
+      # 375 (first, differs from 1280) + final restore = 2; second 375 skipped
+      expect(Percy).to receive(:change_window_dimension_and_wait).twice
+      Percy.capture_responsive_dom(driver, {})
+    end
+
+    it 'passes the requested width and window height to change_window_dimension_and_wait' do
+      allow(Percy).to receive(:get_responsive_widths).and_return([{'width' => 390}])
+      expect(Percy).to receive(:change_window_dimension_and_wait)
+        .with(driver, 390, 900, anything)
+      Percy.capture_responsive_dom(driver, {})
+    end
+
+    it 'uses per-entry height from widths list over the default target_height' do
+      allow(Percy).to receive(:get_responsive_widths).and_return(
+        [{'width' => 390, 'height' => 844}],
+      )
+      expect(Percy).to receive(:change_window_dimension_and_wait)
+        .with(driver, 390, 844, anything)
+      Percy.capture_responsive_dom(driver, {})
+    end
+
+    it 'restores original window dimensions after processing all widths' do
+      allow(Percy).to receive(:get_responsive_widths).and_return([{'width' => 375}])
+      expect(Percy).to receive(:change_window_dimension_and_wait)
+        .with(driver, 1280, 900, anything)
+      Percy.capture_responsive_dom(driver, {})
+    end
+
+    # -----------------------------------------------------------------------
+    # Reload-page flag
+    # -----------------------------------------------------------------------
+
+    context 'when PERCY_RESPONSIVE_CAPTURE_RELOAD_PAGE is true' do
+      before(:each) do
+        stub_const('Percy::PERCY_RESPONSIVE_CAPTURE_RELOAD_PAGE', 'true')
+        allow(Percy).to receive(:fetch_percy_dom).and_return('percy_dom_script')
+        allow(Percy).to receive(:get_responsive_widths).and_return(
+          [{'width' => 375}, {'width' => 768}],
+        )
+        allow(driver).to receive(:navigate).and_return(navigate)
+        allow(navigate).to receive(:refresh)
+      end
+
+      it 'calls driver.navigate.refresh once per width' do
+        expect(navigate).to receive(:refresh).twice
+        Percy.capture_responsive_dom(driver, {})
+      end
+
+      it 're-fetches percy_dom after each reload' do
+        expect(Percy).to receive(:fetch_percy_dom).twice
+        Percy.capture_responsive_dom(driver, {})
+      end
+
+      it 'falls back to driver.driver.browser.navigate.refresh when direct refresh raises' do
+        allow(Percy).to receive(:get_responsive_widths).and_return([{'width' => 375}])
+        allow(navigate).to receive(:refresh).and_raise(StandardError, 'direct refresh failed')
+
+        inner_nav = double('inner_navigate')
+        inner_browser = double('inner_browser')
+        inner_drv     = double('inner_driver', browser: inner_browser)
+        allow(driver).to receive(:driver).and_return(inner_drv)
+        allow(inner_browser).to receive(:navigate).and_return(inner_nav)
+        expect(inner_nav).to receive(:refresh).once
+        Percy.capture_responsive_dom(driver, {})
+      end
+    end
+
+    # -----------------------------------------------------------------------
+    # minHeight / PERCY_RESPONSIVE_CAPTURE_MIN_HEIGHT flag
+    # -----------------------------------------------------------------------
+
+    context 'when PERCY_RESPONSIVE_CAPTURE_MIN_HEIGHT is true' do
+      before(:each) do
+        stub_const('Percy::PERCY_RESPONSIVE_CAPTURE_MIN_HEIGHT', 'true')
+        allow(Percy).to receive(:get_responsive_widths).and_return([{'width' => 390}])
+      end
+
+      it 'uses the minHeight option to compute target height via execute_script' do
+        allow(driver).to receive(:execute_script) do |script|
+          950 if script.include?('outerHeight') && script.include?('800')
+        end
+        expect(Percy).to receive(:change_window_dimension_and_wait)
+          .with(driver, 390, 950, anything)
+        Percy.capture_responsive_dom(driver, {minHeight: 800})
+      end
+
+      it 'uses minHeight from cli_config when not provided in options' do
+        begin
+          Percy.instance_variable_set(:@cli_config, {'snapshot' => {'minHeight' => 700}})
+          allow(driver).to receive(:execute_script) do |script|
+            880 if script.include?('outerHeight') && script.include?('700')
+          end
+          expect(Percy).to receive(:change_window_dimension_and_wait)
+            .with(driver, 390, 880, anything)
+          Percy.capture_responsive_dom(driver, {})
+        ensure
+          Percy.instance_variable_set(:@cli_config, nil)
+        end
+      end
+
+      it 'falls back to window height when the height execute_script raises' do
+        allow(driver).to receive(:execute_script) do |script|
+          raise StandardError, 'script error' if script.include?('outerHeight')
+        end
+        expect(Percy).to receive(:change_window_dimension_and_wait)
+          .with(driver, 390, 900, anything)
+        Percy.capture_responsive_dom(driver, {minHeight: 800})
+      end
+
+      it 'uses the current window height unchanged when minHeight is not set' do
+        expect(Percy).to receive(:change_window_dimension_and_wait)
+          .with(driver, 390, 900, anything)
+        Percy.capture_responsive_dom(driver, {})
+      end
+    end
+  end
 end
 
 RSpec.describe Percy, type: :feature do

@@ -218,16 +218,12 @@ module Percy
                              height: height, width: width, deviceScaleFactor: 1, mobile: false,
                            },)
       else
-
         get_browser_instance(driver).window.resize_to(width, height)
-        sleep(0.5)
-        # 3. FORCE the event to fire so PercyDOM and page listeners react
         driver.execute_script("window.dispatchEvent(new Event('resize'));")
       end
     rescue StandardError => e
       log("Resizing using cdp failed, falling back to driver for width #{width} #{e}", 'debug')
       get_browser_instance(driver).window.resize_to(width, height)
-      sleep(0.5)
       driver.execute_script("window.dispatchEvent(new Event('resize'));")
     end
 
@@ -243,26 +239,21 @@ module Percy
 
   def self.capture_responsive_dom(driver, options, percy_dom_script: nil)
     widths = get_responsive_widths(options[:widths] || [])
-    log(widths.to_s, 'debug')
     dom_snapshots = []
     window_size = get_browser_instance(driver).window.size
     initial_viewport =
-      driver.execute_script('return { w: window.innerWidth, h: window.innerHeight }')
-    window_msg = "Initial Window Size: #{window_size.width}x#{window_size.height} " \
-                 "(Viewport: #{initial_viewport['w']}x#{initial_viewport['h']})"
-    log(window_msg, 'debug')
+    driver.execute_script('return { w: window.innerWidth, h: window.innerHeight }')
     current_width = window_size.width
     current_height = window_size.height
     last_window_width = current_width
+    last_window_height = current_height
     resize_count = 0
     driver.execute_script('PercyDOM.waitForResize()')
-
     target_height = current_height
 
     # If a minimum height is requested via env/config/options, compute a target height
     if PERCY_RESPONSIVE_CAPTURE_MIN_HEIGHT == 'true'
       min_height = options[:minHeight] || @cli_config&.dig('snapshot', 'minHeight')
-      log("current minheight #{min_height}", 'debug')
       if min_height
         begin
           target_height =
@@ -278,10 +269,11 @@ module Percy
       width = width_dict['width']
       height = width_dict['height'] || target_height
 
-      if last_window_width != width
+      if last_window_width != width || last_window_height != height
         resize_count += 1
         change_window_dimension_and_wait(driver, width, height, resize_count)
         last_window_width = width
+        last_window_height = height
       end
 
       if PERCY_RESPONSIVE_CAPTURE_RELOAD_PAGE == 'true'
