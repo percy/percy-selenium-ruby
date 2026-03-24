@@ -257,7 +257,7 @@ module Percy
       if min_height
         begin
           target_height =
-            driver.execute_script("return window.outerHeight - window.innerHeight + #{min_height}")
+            driver.execute_script("return #{min_height}")
           log("Calculated height for responsive capture using minHeight: #{target_height}", 'debug')
         rescue StandardError => e
           log("Failed to calculate responsive target height: #{e}", 'debug')
