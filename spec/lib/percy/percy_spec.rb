@@ -73,9 +73,43 @@ RSpec.describe Percy, type: :feature do
       expect { Percy.snapshot(page) }.to raise_error(ArgumentError)
     end
 
-    it 'logs an error  when sending a snapshot fails' do
+    it 'raises when session_type is automate' do
       stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/healthcheck")
-        .to_return(status: 200, body: '{"success": "true" }',
+        .to_return(
+          status: 200,
+          body: '{"success":true,"type":"automate"}',
+          headers: {'x-percy-core-version': '1.0.0'},
+        )
+
+      expect { Percy.snapshot(page, 'Name') }
+        .to raise_error(StandardError, /Invalid function call - percy_snapshot\(\)/)
+    end
+
+    it 'does not raise when older CLI omits type from healthcheck' do
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/healthcheck")
+        .to_return(
+          status: 200,
+          body: '{"success":true}',
+          headers: {'x-percy-core-version': '1.0.0'},
+        )
+
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/dom.js")
+        .to_return(
+          status: 200,
+          body: fetch_script_string,
+          headers: {},
+        )
+
+      stub_request(:post, 'http://localhost:5338/percy/snapshot')
+        .to_return(status: 200, body: '{"success":true}', headers: {})
+
+      visit 'index.html'
+      expect { Percy.snapshot(page, 'Name') }.to_not raise_error
+    end
+
+    it 'logs an error when sending a snapshot fails' do
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/healthcheck")
+        .to_return(status: 200, body: '{"success":true}',
                    headers: {'x-percy-core-version': '1.0.0'},)
 
       stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/dom.js")
@@ -94,7 +128,7 @@ RSpec.describe Percy, type: :feature do
 
     it 'sends snapshots to the local server' do
       stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/healthcheck")
-        .to_return(status: 200, body: '{"success": "true" }', headers: {
+        .to_return(status: 200, body: '{"success":true}', headers: {
                      'x-percy-core-version': '1.0.0',
                    },)
 
@@ -106,7 +140,7 @@ RSpec.describe Percy, type: :feature do
         )
 
       stub_request(:post, 'http://localhost:5338/percy/snapshot')
-        .to_return(status: 200, body: '{"success": "true" }', headers: {})
+        .to_return(status: 200, body: '{"success":true}', headers: {})
 
       visit 'index.html'
       data = Percy.snapshot(page, 'Name', widths: [944])
@@ -130,7 +164,7 @@ RSpec.describe Percy, type: :feature do
     it 'sends multiple dom snapshots to the local server' do
       stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/healthcheck").to_return(
         status: 200,
-        body: '{"success": "true", "widths": { "mobile": [390], "config": [765, 1280]} }',
+        body: '{"success":true, "widths": { "mobile": [390], "config": [765, 1280]} }',
         headers: {
           'x-percy-core-version': '1.0.0',
           'config': {}, 'widths': {'mobile': [375], 'config': [765, 1280]},
@@ -152,7 +186,7 @@ RSpec.describe Percy, type: :feature do
         )
 
       stub_request(:post, 'http://localhost:5338/percy/snapshot')
-        .to_return(status: 200, body: '{"success": "true" }', headers: {})
+        .to_return(status: 200, body: '{"success":true}', headers: {})
 
       visit 'index.html'
       data = Percy.snapshot(page, 'Name', {responsive_snapshot_capture: true})
@@ -179,7 +213,7 @@ RSpec.describe Percy, type: :feature do
     it 'sends multiple dom snapshots to the local server using selenium' do
       stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/healthcheck").to_return(
         status: 200,
-        body: '{"success": "true", "widths": { "mobile": [390], "config": [765, 1280]} }',
+        body: '{"success":true, "widths": { "mobile": [390], "config": [765, 1280]} }',
         headers: {
           'x-percy-core-version': '1.0.0',
           'config': {}, 'widths': {'mobile': [375], 'config': [765, 1280]},
@@ -203,7 +237,7 @@ RSpec.describe Percy, type: :feature do
       received_body = nil
       stub_request(:post, 'http://localhost:5338/percy/snapshot').to_return do |request|
         received_body = JSON.parse(request.body)
-        {status: 200, body: '{"success": "true" }', headers: {}}
+        {status: 200, body: '{"success":true}', headers: {}}
       end
 
       driver = Selenium::WebDriver.for :firefox
@@ -232,7 +266,7 @@ RSpec.describe Percy, type: :feature do
 
     it 'sends snapshots for sync' do
       stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/healthcheck")
-        .to_return(status: 200, body: '{"success": "true" }',
+        .to_return(status: 200, body: '{"success":true}',
                    headers: {'x-percy-core-version': '1.0.0'},)
 
       stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/dom.js")
@@ -243,7 +277,7 @@ RSpec.describe Percy, type: :feature do
         )
 
       stub_request(:post, 'http://localhost:5338/percy/snapshot')
-        .to_return(status: 200, body: '{"success": "true", "data": "sync_data" }', headers: {})
+        .to_return(status: 200, body: '{"success":true, "data": "sync_data"}', headers: {})
 
       visit 'index.html'
       data = Percy.snapshot(page, 'Name', {sync: true})
@@ -314,6 +348,18 @@ RSpec.describe Percy do
     it 'creates a region with assertion settings' do
       region = Percy.create_region(diff_ignore_threshold: 0.2)
       expect(region[:assertion][:diffIgnoreThreshold]).to eq(0.2)
+    end
+
+    it 'creates a region with configuration settings when algorithm is intelliignore' do
+      region = Percy.create_region(
+        algorithm: 'intelliignore',
+        diff_sensitivity: 0.8,
+        carousels_enabled: true,
+      )
+
+      expect(region[:algorithm]).to eq('intelliignore')
+      expect(region[:configuration][:diffSensitivity]).to eq(0.8)
+      expect(region[:configuration][:carouselsEnabled]).to eq(true)
     end
 
     it 'does not add empty configuration or assertion keys' do
@@ -458,6 +504,7 @@ RSpec.describe Percy do
       allow(driver).to receive(:switch_to).and_return(switch_to)
       allow(switch_to).to receive(:frame)
       allow(switch_to).to receive(:parent_frame)
+      allow(switch_to).to receive(:default_content)
     end
 
     it 'returns a hash with iframeData, iframeSnapshot, and frameUrl on success' do
@@ -532,10 +579,10 @@ RSpec.describe Percy do
       expect(captured_serialize_call).to include('true')
     end
 
-    it 'always switches back to parent frame even when script injection fails' do
+    it 'always switches back to default content even when script injection fails' do
       allow(frame_element).to receive(:attribute).with('src')
         .and_return('https://other.example.com/page')
-      expect(switch_to).to receive(:parent_frame).once
+      expect(switch_to).to receive(:default_content).once
       allow(driver).to receive(:execute_script).and_raise(StandardError, 'error')
 
       Percy.process_frame(driver, frame_element, {}, 'percy_dom_script')
@@ -553,6 +600,7 @@ RSpec.describe Percy do
       allow(driver).to receive(:switch_to).and_return(switch_to)
       allow(switch_to).to receive(:frame)
       allow(switch_to).to receive(:parent_frame)
+      allow(switch_to).to receive(:default_content)
     end
 
     it 'returns the serialized dom with cookies when no iframes present' do
@@ -617,6 +665,7 @@ RSpec.describe Percy do
     it 'does not process cross-origin iframes when percy_dom_script is nil' do
       frame = double('frame')
       allow(frame).to receive(:attribute).with('src').and_return('https://cross.example.com/page')
+      allow(frame).to receive(:attribute).with('data-percy-element-id').and_return(nil)
       allow(driver).to receive(:execute_script).and_return({'html' => '<html/>'})
       allow(driver).to receive(:current_url).and_return('http://main.example.com/')
       allow(driver).to receive(:find_elements).and_return([frame])
@@ -911,6 +960,51 @@ RSpec.describe Percy do
           .with(driver, 390, 900, anything)
         Percy.capture_responsive_dom(driver, {})
       end
+    end
+  end
+end
+
+RSpec.describe Percy do
+  before(:each) do
+    Percy._clear_cache!
+  end
+
+  describe '.responsive_snapshot_capture?' do
+    it 'returns false when deferUploads is enabled in cli_config' do
+      begin
+        Percy.instance_variable_set(:@cli_config, {'percy' => {'deferUploads' => true}})
+        result = Percy.responsive_snapshot_capture?({responsive_snapshot_capture: true})
+        expect(result).to be false
+      ensure
+        Percy.instance_variable_set(:@cli_config, nil)
+      end
+    end
+
+    it 'returns true when responsive_snapshot_capture option is set' do
+      result = Percy.responsive_snapshot_capture?({responsive_snapshot_capture: true})
+      expect(result).to be true
+    end
+
+    it 'returns true when responsiveSnapshotCapture option is set' do
+      result = Percy.responsive_snapshot_capture?({responsiveSnapshotCapture: true})
+      expect(result).to be true
+    end
+
+    it 'returns true when responsiveSnapshotCapture is set in cli_config' do
+      begin
+        Percy.instance_variable_set(
+          :@cli_config, {'snapshot' => {'responsiveSnapshotCapture' => true}},
+        )
+        result = Percy.responsive_snapshot_capture?({})
+        expect(result).to be true
+      ensure
+        Percy.instance_variable_set(:@cli_config, nil)
+      end
+    end
+
+    it 'returns nil when no responsive capture option is set' do
+      result = Percy.responsive_snapshot_capture?({})
+      expect(result).to be_falsey
     end
   end
 end

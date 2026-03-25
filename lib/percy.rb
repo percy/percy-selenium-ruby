@@ -54,7 +54,6 @@ module Percy
     region
   end
 
-  # Take a DOM snapshot and post it to the snapshot endpoint
   def self.snapshot(driver, name, options = {})
     return unless percy_enabled?
 
@@ -95,7 +94,6 @@ module Percy
   end
 
   def self.get_browser_instance(driver)
-    # this means it is a capybara session
     if driver.respond_to?(:driver) && driver.driver.respond_to?(:browser)
       return driver.driver.browser.manage
     end
@@ -104,10 +102,8 @@ module Percy
   end
 
   def self.get_serialized_dom(driver, options, percy_dom_script: nil)
-    # 1. Serialize the main page first (this adds the data-percy-element-ids)
     dom_snapshot = driver.execute_script("return PercyDOM.serialize(#{options.to_json})")
 
-    # 2. Process CORS iframes
     begin
       page_origin = get_origin(driver.current_url)
       iframes = driver.find_elements(:tag_name, 'iframe')
@@ -133,6 +129,11 @@ module Percy
       end
     rescue StandardError => e
       log("Failed to process cross-origin iframes: #{e}", 'debug')
+      begin
+        driver.switch_to.default_content
+      rescue StandardError
+        nil
+      end
     end
 
     dom_snapshot['cookies'] = get_browser_instance(driver).all_cookies
@@ -166,10 +167,23 @@ module Percy
       rescue StandardError => e
         log("Failed to process cross-origin frame #{frame_url}: #{e}", 'debug')
       ensure
-        driver.switch_to.parent_frame
+        begin
+          driver.switch_to.default_content
+        rescue StandardError
+          begin
+            driver.switch_to.parent_frame
+          rescue StandardError
+            nil
+          end
+        end
       end
     rescue StandardError => e
       log("Failed to switch to frame #{frame_url}: #{e}", 'debug')
+      begin
+        driver.switch_to.default_content
+      rescue StandardError
+        nil
+      end
       return nil
     end
 
@@ -209,7 +223,6 @@ module Percy
   end
 
   def self.change_window_dimension_and_wait(driver, width, height, resize_count)
-    # Log the intent
     log("Attempting to resize window to #{width}x#{height}", 'debug')
 
     begin
@@ -254,47 +267,49 @@ module Percy
       target_height = min if min
     end
 
-    widths.each do |width_dict|
-      width = width_dict['width']
-      height = width_dict['height'] || target_height
+    begin
+      widths.each do |width_dict|
+        width = width_dict['width']
+        height = width_dict['height'] || target_height
 
-      if last_window_width != width || last_window_height != height
-        resize_count += 1
-        change_window_dimension_and_wait(driver, width, height, resize_count)
-        last_window_width = width
-        last_window_height = height
-      end
-
-      if PERCY_RESPONSIVE_CAPTURE_RELOAD_PAGE == 'true'
-        log("Reloading page for width: #{width}", 'debug')
-        begin
-          driver.navigate.refresh
-        rescue StandardError
-          begin
-            driver.driver.browser.navigate.refresh
-          rescue StandardError => e
-            log("Failed to refresh page: #{e}", 'debug')
-          end
+        if last_window_width != width || last_window_height != height
+          resize_count += 1
+          change_window_dimension_and_wait(driver, width, height, resize_count)
+          last_window_width = width
+          last_window_height = height
         end
-        percy_dom_script = fetch_percy_dom
-        driver.execute_script(percy_dom_script)
-        driver.execute_script('PercyDOM.waitForResize()')
-        resize_count = 0
+
+        if PERCY_RESPONSIVE_CAPTURE_RELOAD_PAGE == 'true'
+          log("Reloading page for width: #{width}", 'debug')
+          begin
+            driver.navigate.refresh
+          rescue StandardError
+            begin
+              driver.driver.browser.navigate.refresh
+            rescue StandardError => e
+              log("Failed to refresh page: #{e}", 'debug')
+            end
+          end
+          percy_dom_script = fetch_percy_dom
+          driver.execute_script(percy_dom_script)
+          driver.execute_script('PercyDOM.waitForResize()')
+          resize_count = 0
+        end
+
+        sleep(RESPONSIVE_CAPTURE_SLEEP_TIME.to_i) if RESPONSIVE_CAPTURE_SLEEP_TIME
+
+        dom_snapshot = get_serialized_dom(driver, options, percy_dom_script: percy_dom_script)
+        dom_snapshot['width'] = width
+        dom_snapshots << dom_snapshot
       end
-
-      sleep(RESPONSIVE_CAPTURE_SLEEP_TIME.to_i) if RESPONSIVE_CAPTURE_SLEEP_TIME
-
-      dom_snapshot = get_serialized_dom(driver, options, percy_dom_script: percy_dom_script)
-      dom_snapshot['width'] = width
-      dom_snapshots << dom_snapshot
+    ensure
+      change_window_dimension_and_wait(driver, current_width, current_height, resize_count + 1)
     end
 
-    change_window_dimension_and_wait(driver, current_width, current_height, resize_count + 1)
     dom_snapshots
   end
 
   def self.responsive_snapshot_capture?(options)
-    # Don't run responsive snapshot capture when defer uploads is enabled
     return false if @cli_config&.dig('percy', 'deferUploads')
 
     options[:responsive_snapshot_capture] ||
@@ -302,7 +317,6 @@ module Percy
       @cli_config&.dig('snapshot', 'responsiveSnapshotCapture')
   end
 
-  # Determine if the Percy server is running, caching the result so it is only checked once
   def self.percy_enabled?
     return @percy_enabled unless @percy_enabled.nil?
 
@@ -338,7 +352,6 @@ module Percy
     end
   end
 
-  # Fetch the @percy/dom script, caching the result so it is only fetched once
   def self.fetch_percy_dom
     return @percy_dom unless @percy_dom.nil?
 
@@ -361,8 +374,6 @@ module Percy
     end
   end
 
-  # Make an HTTP request (GET,POST) using Ruby's Net::HTTP. If `data` is present,
-  # `fetch` will POST as JSON.
   def self.fetch(url, data = nil)
     uri = URI("#{PERCY_SERVER_ADDRESS}/#{url}")
 
@@ -383,7 +394,6 @@ module Percy
     response
   end
 
-  # Take a screenshot on a Percy Automate session
   def self.percy_screenshot(driver, name, options = {})
     return unless percy_enabled?
 
@@ -446,7 +456,6 @@ module Percy
   def self._clear_cache!
     @percy_dom = nil
     @percy_enabled = nil
-    @eligible_widths = nil
     @cli_config = nil
     @session_type = nil
     Cache.clear_cache!
