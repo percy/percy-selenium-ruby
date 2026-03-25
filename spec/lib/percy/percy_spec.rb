@@ -663,12 +663,9 @@ RSpec.describe Percy do
     end
 
     it 'does not process cross-origin iframes when percy_dom_script is nil' do
-      frame = double('frame')
-      allow(frame).to receive(:attribute).with('src').and_return('https://cross.example.com/page')
-      allow(frame).to receive(:attribute).with('data-percy-element-id').and_return(nil)
       allow(driver).to receive(:execute_script).and_return({'html' => '<html/>'})
       allow(driver).to receive(:current_url).and_return('http://main.example.com/')
-      allow(driver).to receive(:find_elements).and_return([frame])
+      expect(driver).to_not receive(:find_elements)
 
       dom = Percy.get_serialized_dom(driver, {}, percy_dom_script: nil)
       expect(dom).to_not have_key('corsIframes')

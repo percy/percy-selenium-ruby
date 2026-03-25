@@ -32,6 +32,12 @@ class Cache
     end
   end
 
+  def self.clear_cache!
+    MUTEX.synchronize do
+      CACHE.clear
+    end
+  end
+
   def self.cleanup_cache
     now = Time.now.to_f
     CACHE.delete_if do |_, session|
@@ -39,10 +45,5 @@ class Cache
       timestamp && (now - timestamp >= CACHE_TIMEOUT)
     end
   end
-
-  def self.clear_cache!
-    MUTEX.synchronize do
-      CACHE.clear
-    end
-  end
+  private_class_method :cleanup_cache
 end

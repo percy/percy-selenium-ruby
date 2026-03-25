@@ -117,7 +117,7 @@ module Percy
     dom_snapshot = driver.execute_script("return PercyDOM.serialize(#{options.to_json})")
     begin
       page_origin = get_origin(driver.current_url)
-      iframes = driver.find_elements(:tag_name, 'iframe')
+      iframes = percy_dom_script ? driver.find_elements(:tag_name, 'iframe') : []
       if iframes.any?
         processed_frames = []
         iframes.each do |frame|
@@ -277,7 +277,12 @@ module Percy
 
     if responsive_capture_min_height?
       min = options[:minHeight] || @cli_config&.dig('snapshot', 'minHeight')
-      target_height = min if min
+      if min
+        target_height = min
+      else
+        log('PERCY_RESPONSIVE_CAPTURE_MIN_HEIGHT is enabled but no minHeight value ' \
+            'was provided in options or CLI config; using current window height', 'debug',)
+      end
     end
 
     begin

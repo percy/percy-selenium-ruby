@@ -86,22 +86,22 @@ RSpec.describe Cache do
     end
 
     it 'calls cleanup_cache' do
-      expect(Cache).to receive(:cleanup_cache).and_call_original
+      expect(Cache).to receive(:cleanup_cache).and_call_original # private method expectation
       Cache.get_cache(session_id, Cache::COMMAND_EXECUTOR_URL)
     end
   end
 
-  describe '.cleanup_cache' do
+  describe '.cleanup_cache (private, tested via send)' do
     it 'removes entries that have exceeded the cache timeout' do
       Cache.set_cache(session_id, Cache::COMMAND_EXECUTOR_URL, url)
       Cache::CACHE[session_id][Cache::TIMEOUT_KEY] = Time.now.to_f - (Cache::CACHE_TIMEOUT + 1)
-      Cache.cleanup_cache
+      Cache.send(:cleanup_cache)
       expect(Cache::CACHE).to_not have_key(session_id)
     end
 
     it 'keeps entries that have not exceeded the cache timeout' do
       Cache.set_cache(session_id, Cache::COMMAND_EXECUTOR_URL, url)
-      Cache.cleanup_cache
+      Cache.send(:cleanup_cache)
       expect(Cache::CACHE).to have_key(session_id)
     end
 
@@ -110,7 +110,7 @@ RSpec.describe Cache do
       Cache.set_cache(session_id, Cache::COMMAND_EXECUTOR_URL, url)
       Cache.set_cache(expired_session, Cache::COMMAND_EXECUTOR_URL, url)
       Cache::CACHE[expired_session][Cache::TIMEOUT_KEY] = Time.now.to_f - (Cache::CACHE_TIMEOUT + 1)
-      Cache.cleanup_cache
+      Cache.send(:cleanup_cache)
       expect(Cache::CACHE).to have_key(session_id)
       expect(Cache::CACHE).to_not have_key(expired_session)
     end
