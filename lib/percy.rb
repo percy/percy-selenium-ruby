@@ -461,3 +461,4 @@ module Percy
     Cache.clear_cache!
   end
 end
+
