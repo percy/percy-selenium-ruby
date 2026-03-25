@@ -14,10 +14,6 @@ class DriverMetaData
     return cached unless cached.nil?
 
     url = nil
-
-    # Selenium WebDriver 4.x does not expose the server URL publicly.
-    # We access it via the private bridge.http interface. Tested on
-    # selenium-webdriver 4.0-4.41. May need updating for future major versions.
     begin
       raw = @driver.send(:bridge).http.send(:server_url)
       url = raw.to_s unless raw.nil?

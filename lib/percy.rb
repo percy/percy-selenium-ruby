@@ -15,20 +15,16 @@ module Percy
   PERCY_DEBUG = ENV['PERCY_LOGLEVEL'] == 'debug'
   PERCY_SERVER_ADDRESS = ENV['PERCY_SERVER_ADDRESS'] || 'http://localhost:5338'
   LABEL = "[\u001b[35m" + (PERCY_DEBUG ? 'percy:ruby' : 'percy') + "\u001b[39m]"
-  # RESONSIVE_CAPTURE_SLEEP_TIME (typo) kept for backward compatibility; prefer
-  # RESPONSIVE_CAPTURE_SLEEP_TIME in new configurations.
   RESPONSIVE_CAPTURE_SLEEP_TIME = ENV['RESPONSIVE_CAPTURE_SLEEP_TIME'] ||
     ENV['RESONSIVE_CAPTURE_SLEEP_TIME']
 
   def self.responsive_capture_reload_page?
-    # PERCY_RESONSIVE_CAPTURE_RELOAD_PAGE (typo) kept for backward compatibility.
     val = ENV['PERCY_RESPONSIVE_CAPTURE_RELOAD_PAGE'] ||
       ENV['PERCY_RESONSIVE_CAPTURE_RELOAD_PAGE'] || 'false'
     val.casecmp('true') == 0
   end
 
   def self.responsive_capture_min_height?
-    # PERCY_RESONSIVE_CAPTURE_MIN_HEIGHT (typo) kept for backward compatibility.
     val = ENV['PERCY_RESPONSIVE_CAPTURE_MIN_HEIGHT'] ||
       ENV['PERCY_RESONSIVE_CAPTURE_MIN_HEIGHT'] || 'false'
     val.casecmp('true') == 0
