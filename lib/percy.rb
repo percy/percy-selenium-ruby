@@ -111,7 +111,7 @@ module Percy
     begin
       page_origin = get_origin(driver.current_url)
       iframes = driver.find_elements(:tag_name, 'iframe')
-      if iframes.any? && percy_dom_script
+      if iframes.any?
         processed_frames = []
         iframes.each do |frame|
           frame_src = frame.attribute('src')
