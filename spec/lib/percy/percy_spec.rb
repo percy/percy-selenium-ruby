@@ -895,7 +895,7 @@ RSpec.describe Percy do
 
     context 'when PERCY_RESPONSIVE_CAPTURE_RELOAD_PAGE is true' do
       before(:each) do
-        stub_const('Percy::PERCY_RESPONSIVE_CAPTURE_RELOAD_PAGE', 'true')
+        allow(Percy).to receive(:responsive_capture_reload_page?).and_return(true)
         allow(Percy).to receive(:fetch_percy_dom).and_return('percy_dom_script')
         allow(Percy).to receive(:get_responsive_widths).and_return(
           [{'width' => 375}, {'width' => 768}],
@@ -934,7 +934,7 @@ RSpec.describe Percy do
 
     context 'when PERCY_RESPONSIVE_CAPTURE_MIN_HEIGHT is true' do
       before(:each) do
-        stub_const('Percy::PERCY_RESPONSIVE_CAPTURE_MIN_HEIGHT', 'true')
+        allow(Percy).to receive(:responsive_capture_min_height?).and_return(true)
         allow(Percy).to receive(:get_responsive_widths).and_return([{'width' => 390}])
       end
 
@@ -1026,7 +1026,8 @@ RSpec.describe Percy, type: :feature do
       healthcheck = requests[0]
       expect(healthcheck['url']).to eq('/percy/healthcheck')
 
-      snap = requests[2]['body']
+      snap_request = requests.find { |r| r['url'] == '/percy/snapshot' }
+      snap = snap_request['body']
       expect(snap['name']).to eq('Name')
       expect(snap['url']).to eq('http://127.0.0.1:3003/index.html')
       expect(snap['client_info']).to include('percy-selenium-ruby')

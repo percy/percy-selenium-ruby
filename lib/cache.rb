@@ -2,6 +2,7 @@ class Cache
   CACHE = {} # rubocop:disable Style/MutableConstant
   CACHE_TIMEOUT = 5 * 60 # 300 seconds
   TIMEOUT_KEY = 'last_access_time'.freeze
+  MUTEX = Mutex.new
 
   # Caching Keys
   CAPABILITIES = 'capabilities'.freeze
@@ -14,17 +15,21 @@ class Cache
 
   def self.set_cache(session_id, property, value)
     check_types(session_id, property)
-    session = CACHE[session_id] || {}
-    session[TIMEOUT_KEY] = Time.now.to_f
-    session[property] = value
-    CACHE[session_id] = session
+    MUTEX.synchronize do
+      session = CACHE[session_id] || {}
+      session[TIMEOUT_KEY] = Time.now.to_f
+      session[property] = value
+      CACHE[session_id] = session
+    end
   end
 
   def self.get_cache(session_id, property)
-    cleanup_cache
     check_types(session_id, property)
-    session = CACHE[session_id] || {}
-    session[property]
+    MUTEX.synchronize do
+      cleanup_cache
+      session = CACHE[session_id] || {}
+      session[property]
+    end
   end
 
   def self.cleanup_cache
@@ -36,6 +41,8 @@ class Cache
   end
 
   def self.clear_cache!
-    CACHE.clear
+    MUTEX.synchronize do
+      CACHE.clear
+    end
   end
 end

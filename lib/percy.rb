@@ -9,15 +9,30 @@ module Percy
   CLIENT_INFO = "percy-selenium-ruby/#{VERSION}".freeze
   ENV_INFO = "selenium/#{Selenium::WebDriver::VERSION} ruby/#{RUBY_VERSION}".freeze
 
+  SESSION_TYPE_AUTOMATE = 'automate'.freeze
+  SESSION_TYPE_WEB = 'web'.freeze
+
   PERCY_DEBUG = ENV['PERCY_LOGLEVEL'] == 'debug'
   PERCY_SERVER_ADDRESS = ENV['PERCY_SERVER_ADDRESS'] || 'http://localhost:5338'
   LABEL = "[\u001b[35m" + (PERCY_DEBUG ? 'percy:ruby' : 'percy') + "\u001b[39m]"
+  # RESONSIVE_CAPTURE_SLEEP_TIME (typo) kept for backward compatibility; prefer
+  # RESPONSIVE_CAPTURE_SLEEP_TIME in new configurations.
   RESPONSIVE_CAPTURE_SLEEP_TIME = ENV['RESPONSIVE_CAPTURE_SLEEP_TIME'] ||
     ENV['RESONSIVE_CAPTURE_SLEEP_TIME']
-  PERCY_RESPONSIVE_CAPTURE_RELOAD_PAGE =
-    (ENV['PERCY_RESPONSIVE_CAPTURE_RELOAD_PAGE'] || 'false').downcase
-  PERCY_RESPONSIVE_CAPTURE_MIN_HEIGHT =
-    (ENV['PERCY_RESPONSIVE_CAPTURE_MIN_HEIGHT'] || 'false').downcase
+
+  def self.responsive_capture_reload_page?
+    # PERCY_RESONSIVE_CAPTURE_RELOAD_PAGE (typo) kept for backward compatibility.
+    val = ENV['PERCY_RESPONSIVE_CAPTURE_RELOAD_PAGE'] ||
+      ENV['PERCY_RESONSIVE_CAPTURE_RELOAD_PAGE'] || 'false'
+    val.casecmp('true') == 0
+  end
+
+  def self.responsive_capture_min_height?
+    # PERCY_RESONSIVE_CAPTURE_MIN_HEIGHT (typo) kept for backward compatibility.
+    val = ENV['PERCY_RESPONSIVE_CAPTURE_MIN_HEIGHT'] ||
+      ENV['PERCY_RESONSIVE_CAPTURE_MIN_HEIGHT'] || 'false'
+    val.casecmp('true') == 0
+  end
 
   def self.create_region(
     bounding_box: nil, element_xpath: nil, element_css: nil, padding: nil,
@@ -58,7 +73,7 @@ module Percy
   def self.snapshot(driver, name, options = {})
     return unless percy_enabled?
 
-    if @session_type == 'automate'
+    if @session_type == SESSION_TYPE_AUTOMATE
       raise StandardError, 'Invalid function call - percy_snapshot(). ' \
         'Please use percy_screenshot() function while using Percy with Automate. ' \
         'For more information on usage of percy_screenshot(), ' \
@@ -147,6 +162,8 @@ module Percy
 
   def self.get_origin(url)
     uri = URI.parse(url)
+    raise URI::InvalidURIError, "no host in #{url}" if uri.host.nil?
+
     netloc = uri.host.to_s
     default_ports = {'http' => 80, 'https' => 443}
     netloc += ":#{uri.port}" if uri.port && uri.port != default_ports[uri.scheme]
@@ -262,7 +279,7 @@ module Percy
     driver.execute_script('PercyDOM.waitForResize()')
     target_height = current_height
 
-    if PERCY_RESPONSIVE_CAPTURE_MIN_HEIGHT == 'true'
+    if responsive_capture_min_height?
       min = options[:minHeight] || @cli_config&.dig('snapshot', 'minHeight')
       target_height = min if min
     end
@@ -279,7 +296,7 @@ module Percy
           last_window_height = height
         end
 
-        if PERCY_RESPONSIVE_CAPTURE_RELOAD_PAGE == 'true'
+        if responsive_capture_reload_page?
           log("Reloading page for width: #{width}", 'debug')
           begin
             driver.navigate.refresh
@@ -397,7 +414,7 @@ module Percy
   def self.percy_screenshot(driver, name, options = {})
     return unless percy_enabled?
 
-    unless @session_type == 'automate'
+    unless @session_type == SESSION_TYPE_AUTOMATE
       raise StandardError, 'Invalid function call - percy_screenshot(). ' \
         'Please use percy_snapshot() function for taking screenshot. ' \
         'percy_screenshot() should be used only while using Percy with Automate. ' \
@@ -406,6 +423,7 @@ module Percy
     end
 
     begin
+      options = options.dup
       metadata = get_driver_metadata(driver)
 
       if options.key?(:ignoreRegionSeleniumElements)
