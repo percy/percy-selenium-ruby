@@ -12,7 +12,8 @@ module Percy
   PERCY_DEBUG = ENV['PERCY_LOGLEVEL'] == 'debug'
   PERCY_SERVER_ADDRESS = ENV['PERCY_SERVER_ADDRESS'] || 'http://localhost:5338'
   LABEL = "[\u001b[35m" + (PERCY_DEBUG ? 'percy:ruby' : 'percy') + "\u001b[39m]"
-  RESPONSIVE_CAPTURE_SLEEP_TIME = ENV['RESPONSIVE_CAPTURE_SLEEP_TIME']
+  RESPONSIVE_CAPTURE_SLEEP_TIME = ENV['RESPONSIVE_CAPTURE_SLEEP_TIME'] ||
+    ENV['RESONSIVE_CAPTURE_SLEEP_TIME']
   PERCY_RESPONSIVE_CAPTURE_RELOAD_PAGE =
     (ENV['PERCY_RESPONSIVE_CAPTURE_RELOAD_PAGE'] || 'false').downcase
   PERCY_RESPONSIVE_CAPTURE_MIN_HEIGHT =
@@ -54,6 +55,7 @@ module Percy
     region
   end
 
+  # Take a DOM snapshot and post it to the snapshot endpoint
   def self.snapshot(driver, name, options = {})
     return unless percy_enabled?
 
@@ -94,6 +96,7 @@ module Percy
   end
 
   def self.get_browser_instance(driver)
+    # this means it is a capybara session
     if driver.respond_to?(:driver) && driver.driver.respond_to?(:browser)
       return driver.driver.browser.manage
     end
@@ -102,8 +105,8 @@ module Percy
   end
 
   def self.get_serialized_dom(driver, options, percy_dom_script: nil)
+    # 1. Serialize the main page first (this adds the data-percy-element-ids)
     dom_snapshot = driver.execute_script("return PercyDOM.serialize(#{options.to_json})")
-
     begin
       page_origin = get_origin(driver.current_url)
       iframes = driver.find_elements(:tag_name, 'iframe')
@@ -223,6 +226,7 @@ module Percy
   end
 
   def self.change_window_dimension_and_wait(driver, width, height, resize_count)
+    # Log the intent
     log("Attempting to resize window to #{width}x#{height}", 'debug')
 
     begin
@@ -310,6 +314,7 @@ module Percy
   end
 
   def self.responsive_snapshot_capture?(options)
+    # Don't run responsive snapshot capture when defer uploads is enabled
     return false if @cli_config&.dig('percy', 'deferUploads')
 
     options[:responsive_snapshot_capture] ||
@@ -317,6 +322,7 @@ module Percy
       @cli_config&.dig('snapshot', 'responsiveSnapshotCapture')
   end
 
+  # Determine if the Percy server is running, caching the result so it is only checked once
   def self.percy_enabled?
     return @percy_enabled unless @percy_enabled.nil?
 
@@ -352,6 +358,7 @@ module Percy
     end
   end
 
+  # Fetch the @percy/dom script, caching the result so it is only fetched once
   def self.fetch_percy_dom
     return @percy_dom unless @percy_dom.nil?
 
@@ -374,6 +381,8 @@ module Percy
     end
   end
 
+  # Make an HTTP request (GET,POST) using Ruby's Net::HTTP. If `data` is present,
+  # `fetch` will POST as JSON.
   def self.fetch(url, data = nil)
     uri = URI("#{PERCY_SERVER_ADDRESS}/#{url}")
 
@@ -394,6 +403,7 @@ module Percy
     response
   end
 
+  # Take a screenshot on a Percy Automate session
   def self.percy_screenshot(driver, name, options = {})
     return unless percy_enabled?
 
