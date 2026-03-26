@@ -3,15 +3,32 @@ require 'json'
 require 'version'
 require 'net/http'
 require 'selenium-webdriver'
+require_relative 'driver_metadata'
 
 module Percy
   CLIENT_INFO = "percy-selenium-ruby/#{VERSION}".freeze
   ENV_INFO = "selenium/#{Selenium::WebDriver::VERSION} ruby/#{RUBY_VERSION}".freeze
 
+  SESSION_TYPE_AUTOMATE = 'automate'.freeze
+  SESSION_TYPE_WEB = 'web'.freeze
+
   PERCY_DEBUG = ENV['PERCY_LOGLEVEL'] == 'debug'
   PERCY_SERVER_ADDRESS = ENV['PERCY_SERVER_ADDRESS'] || 'http://localhost:5338'
   LABEL = "[\u001b[35m" + (PERCY_DEBUG ? 'percy:ruby' : 'percy') + "\u001b[39m]"
-  RESONSIVE_CAPTURE_SLEEP_TIME = ENV['RESONSIVE_CAPTURE_SLEEP_TIME']
+  RESPONSIVE_CAPTURE_SLEEP_TIME = ENV['RESPONSIVE_CAPTURE_SLEEP_TIME'] ||
+    ENV['RESONSIVE_CAPTURE_SLEEP_TIME']
+
+  def self.responsive_capture_reload_page?
+    val = ENV['PERCY_RESPONSIVE_CAPTURE_RELOAD_PAGE'] ||
+      ENV['PERCY_RESONSIVE_CAPTURE_RELOAD_PAGE'] || 'false'
+    val.casecmp('true') == 0
+  end
+
+  def self.responsive_capture_min_height?
+    val = ENV['PERCY_RESPONSIVE_CAPTURE_MIN_HEIGHT'] ||
+      ENV['PERCY_RESONSIVE_CAPTURE_MIN_HEIGHT'] || 'false'
+    val.casecmp('true') == 0
+  end
 
   def self.create_region(
     bounding_box: nil, element_xpath: nil, element_css: nil, padding: nil,
@@ -49,16 +66,23 @@ module Percy
     region
   end
 
-  # Take a DOM snapshot and post it to the snapshot endpoint
   def self.snapshot(driver, name, options = {})
     return unless percy_enabled?
 
+    if @session_type == SESSION_TYPE_AUTOMATE
+      raise StandardError, 'Invalid function call - percy_snapshot(). ' \
+        'Please use percy_screenshot() function while using Percy with Automate. ' \
+        'For more information on usage of percy_screenshot(), ' \
+        'refer https://www.browserstack.com/docs/percy/integrate/functional-and-visual'
+    end
+
     begin
-      driver.execute_script(fetch_percy_dom)
+      percy_dom_script = fetch_percy_dom
+      driver.execute_script(percy_dom_script)
       dom_snapshot = if responsive_snapshot_capture?(options)
-        capture_responsive_dom(driver, options)
+        capture_responsive_dom(driver, options, percy_dom_script: percy_dom_script)
       else
-        get_serialized_dom(driver, options)
+        get_serialized_dom(driver, options, percy_dom_script: percy_dom_script)
       end
 
       response = fetch('percy/snapshot',
@@ -69,11 +93,11 @@ module Percy
         environment_info: ENV_INFO,
         **options,)
 
-      unless response.body.to_json['success']
-        raise StandardError, data['error']
+      body = JSON.parse(response.body)
+      unless body['success']
+        raise StandardError, body['error']
       end
 
-      body = JSON.parse(response.body)
       body['data']
     rescue StandardError => e
       log("Could not take DOM snapshot '#{name}'")
@@ -82,7 +106,6 @@ module Percy
   end
 
   def self.get_browser_instance(driver)
-    # this means it is a capybara session
     if driver.respond_to?(:driver) && driver.driver.respond_to?(:browser)
       return driver.driver.browser.manage
     end
@@ -90,28 +113,131 @@ module Percy
     driver.manage
   end
 
-  def self.get_serialized_dom(driver, options)
+  def self.get_serialized_dom(driver, options, percy_dom_script: nil)
     dom_snapshot = driver.execute_script("return PercyDOM.serialize(#{options.to_json})")
+    begin
+      page_origin = get_origin(driver.current_url)
+      iframes = percy_dom_script ? driver.find_elements(:tag_name, 'iframe') : []
+      if iframes.any?
+        processed_frames = []
+        iframes.each do |frame|
+          frame_src = frame.attribute('src')
+          next if unsupported_iframe_src?(frame_src)
+
+          begin
+            frame_origin = get_origin(URI.join(driver.current_url, frame_src).to_s)
+          rescue StandardError => e
+            log("Skipping iframe \"#{frame_src}\": #{e}", 'debug')
+            next
+          end
+
+          next if frame_origin == page_origin
+
+          result = process_frame(driver, frame, options, percy_dom_script)
+          processed_frames << result if result
+        end
+        dom_snapshot['corsIframes'] = processed_frames if processed_frames.any?
+      end
+    rescue StandardError => e
+      log("Failed to process cross-origin iframes: #{e}", 'debug')
+      begin
+        driver.switch_to.default_content
+      rescue StandardError
+        nil
+      end
+    end
 
     dom_snapshot['cookies'] = get_browser_instance(driver).all_cookies
     dom_snapshot
   end
 
-  def self.get_widths_for_multi_dom(options)
-    user_passed_widths = options[:widths] || []
+  def self.unsupported_iframe_src?(src)
+    src.nil? || src.empty? || src == 'about:blank' ||
+      src.start_with?('javascript:') || src.start_with?('data:') || src.start_with?('vbscript:')
+  end
 
-    # Deep copy mobile widths otherwise it will get overridden
-    all_widths = @eligible_widths['mobile']&.dup || []
-    if user_passed_widths.any?
-      all_widths.concat(user_passed_widths)
-    else
-      all_widths.concat(@eligible_widths['config'] || [])
+  def self.get_origin(url)
+    uri = URI.parse(url)
+    raise URI::InvalidURIError, "no host in #{url}" if uri.host.nil?
+
+    netloc = uri.host.to_s
+    default_ports = {'http' => 80, 'https' => 443}
+    netloc += ":#{uri.port}" if uri.port && uri.port != default_ports[uri.scheme]
+    "#{uri.scheme}://#{netloc}"
+  end
+
+  def self.process_frame(driver, frame_element, options, percy_dom_script)
+    frame_url = frame_element.attribute('src') || 'unknown-src'
+    iframe_snapshot = nil
+
+    begin
+      driver.switch_to.frame(frame_element)
+      begin
+        driver.execute_script(percy_dom_script)
+        iframe_options = options.merge('enableJavaScript' => true)
+        iframe_snapshot =
+          driver.execute_script("return PercyDOM.serialize(#{iframe_options.to_json})")
+      rescue StandardError => e
+        log("Failed to process cross-origin frame #{frame_url}: #{e}", 'debug')
+      ensure
+        begin
+          driver.switch_to.default_content
+        rescue StandardError
+          begin
+            driver.switch_to.parent_frame
+          rescue StandardError
+            nil
+          end
+        end
+      end
+    rescue StandardError => e
+      log("Failed to switch to frame #{frame_url}: #{e}", 'debug')
+      begin
+        driver.switch_to.default_content
+      rescue StandardError
+        nil
+      end
+      return nil
     end
 
-    all_widths.uniq
+    return nil if iframe_snapshot.nil?
+
+    percy_element_id = frame_element.attribute('data-percy-element-id')
+    unless percy_element_id
+      log("Skipping frame #{frame_url}: no matching percyElementId found", 'debug')
+      return nil
+    end
+
+    {
+      'iframeData' => {'percyElementId' => percy_element_id},
+      'iframeSnapshot' => iframe_snapshot,
+      'frameUrl' => frame_url,
+    }
+  end
+
+  def self.get_responsive_widths(widths = [])
+    begin
+      widths_list = widths.is_a?(Array) ? widths : []
+      query_param = widths_list.any? ? "?widths=#{widths_list.join(',')}" : ''
+      response = fetch("percy/widths-config#{query_param}")
+      data = JSON.parse(response.body)
+      widths_data = data['widths']
+      unless widths_data.is_a?(Array)
+        msg = 'Update Percy CLI to the latest version to use responsiveSnapshotCapture'
+        raise StandardError, msg
+      end
+
+      widths_data
+    rescue StandardError => e
+      log("Failed to get responsive widths: #{e}.", 'debug')
+      raise StandardError, 'Update Percy CLI to the latest version to use ' \
+        'responsiveSnapshotCapture'
+    end
   end
 
   def self.change_window_dimension_and_wait(driver, width, height, resize_count)
+    log("Attempting to resize window to #{width}x#{height}", 'debug')
+
     begin
       if driver.capabilities.browser_name == 'chrome' && driver.respond_to?(:execute_cdp)
         driver.execute_cdp('Emulation.setDeviceMetricsOverride', {
@@ -119,50 +245,89 @@ module Percy
                            },)
       else
         get_browser_instance(driver).window.resize_to(width, height)
+        driver.execute_script("window.dispatchEvent(new Event('resize'));")
       end
     rescue StandardError => e
       log("Resizing using cdp failed, falling back to driver for width #{width} #{e}", 'debug')
       get_browser_instance(driver).window.resize_to(width, height)
+      driver.execute_script("window.dispatchEvent(new Event('resize'));")
     end
 
     begin
       wait = Selenium::WebDriver::Wait.new(timeout: 1)
       wait.until { driver.execute_script('return window.resizeCount') == resize_count }
+      actual_size = driver.execute_script('return { w: window.innerWidth, h: window.innerHeight }')
+      log("Resize successful. New Viewport Size: #{actual_size['w']}x#{actual_size['h']}", 'debug')
     rescue Selenium::WebDriver::Error::TimeoutError
       log("Timed out waiting for window resize event for width #{width}", 'debug')
     end
   end
 
-  def self.capture_responsive_dom(driver, options)
-    widths = get_widths_for_multi_dom(options)
+  def self.capture_responsive_dom(driver, options, percy_dom_script: nil)
+    widths = get_responsive_widths(options[:widths] || [])
     dom_snapshots = []
     window_size = get_browser_instance(driver).window.size
     current_width = window_size.width
     current_height = window_size.height
     last_window_width = current_width
+    last_window_height = current_height
     resize_count = 0
     driver.execute_script('PercyDOM.waitForResize()')
+    target_height = current_height
 
-    widths.each do |width|
-      if last_window_width != width
-        resize_count += 1
-        change_window_dimension_and_wait(driver, width, current_height, resize_count)
-        last_window_width = width
+    if responsive_capture_min_height?
+      min = options[:minHeight] || @cli_config&.dig('snapshot', 'minHeight')
+      if min
+        target_height = min
+      else
+        log('PERCY_RESPONSIVE_CAPTURE_MIN_HEIGHT is enabled but no minHeight value ' \
+            'was provided in options or CLI config; using current window height', 'debug',)
       end
-
-      sleep(RESONSIVE_CAPTURE_SLEEP_TIME.to_i) if defined?(RESONSIVE_CAPTURE_SLEEP_TIME)
-
-      dom_snapshot = get_serialized_dom(driver, options)
-      dom_snapshot['width'] = width
-      dom_snapshots << dom_snapshot
     end
 
-    change_window_dimension_and_wait(driver, current_width, current_height, resize_count + 1)
+    begin
+      widths.each do |width_dict|
+        width = width_dict['width']
+        height = width_dict['height'] || target_height
+
+        if last_window_width != width || last_window_height != height
+          resize_count += 1
+          change_window_dimension_and_wait(driver, width, height, resize_count)
+          last_window_width = width
+          last_window_height = height
+        end
+
+        if responsive_capture_reload_page?
+          log("Reloading page for width: #{width}", 'debug')
+          begin
+            driver.navigate.refresh
+          rescue StandardError
+            begin
+              driver.driver.browser.navigate.refresh
+            rescue StandardError => e
+              log("Failed to refresh page: #{e}", 'debug')
+            end
+          end
+          percy_dom_script = fetch_percy_dom
+          driver.execute_script(percy_dom_script)
+          driver.execute_script('PercyDOM.waitForResize()')
+          resize_count = 0
+        end
+
+        sleep(RESPONSIVE_CAPTURE_SLEEP_TIME.to_i) if RESPONSIVE_CAPTURE_SLEEP_TIME
+
+        dom_snapshot = get_serialized_dom(driver, options, percy_dom_script: percy_dom_script)
+        dom_snapshot['width'] = width
+        dom_snapshots << dom_snapshot
+      end
+    ensure
+      change_window_dimension_and_wait(driver, current_width, current_height, resize_count + 1)
+    end
+
     dom_snapshots
   end
 
   def self.responsive_snapshot_capture?(options)
-    # Don't run responsive snapshot capture when defer uploads is enabled
     return false if @cli_config&.dig('percy', 'deferUploads')
 
     options[:responsive_snapshot_capture] ||
@@ -170,7 +335,6 @@ module Percy
       @cli_config&.dig('snapshot', 'responsiveSnapshotCapture')
   end
 
-  # Determine if the Percy server is running, caching the result so it is only checked once
   def self.percy_enabled?
     return @percy_enabled unless @percy_enabled.nil?
 
@@ -194,8 +358,8 @@ module Percy
       end
 
       response_body = JSON.parse(response.body)
-      @eligible_widths = response_body['widths']
       @cli_config = response_body['config']
+      @session_type = response_body['type']
       @percy_enabled = true
       true
     rescue StandardError => e
@@ -206,7 +370,6 @@ module Percy
     end
   end
 
-  # Fetch the @percy/dom script, caching the result so it is only fetched once
   def self.fetch_percy_dom
     return @percy_dom unless @percy_dom.nil?
 
@@ -229,8 +392,6 @@ module Percy
     end
   end
 
-  # Make an HTTP request (GET,POST) using Ruby's Net::HTTP. If `data` is present,
-  # `fetch` will POST as JSON.
   def self.fetch(url, data = nil)
     uri = URI("#{PERCY_SERVER_ADDRESS}/#{url}")
 
@@ -251,10 +412,71 @@ module Percy
     response
   end
 
+  def self.percy_screenshot(driver, name, options = {})
+    return unless percy_enabled?
+
+    unless @session_type == SESSION_TYPE_AUTOMATE
+      raise StandardError, 'Invalid function call - percy_screenshot(). ' \
+        'Please use percy_snapshot() function for taking screenshot. ' \
+        'percy_screenshot() should be used only while using Percy with Automate. ' \
+        'For more information on usage of percy_snapshot(), ' \
+        'refer doc for your language https://www.browserstack.com/docs/percy/integrate/overview'
+    end
+
+    begin
+      options = options.dup
+      metadata = get_driver_metadata(driver)
+
+      if options.key?(:ignoreRegionSeleniumElements)
+        options[:ignore_region_selenium_elements] = options.delete(:ignoreRegionSeleniumElements)
+      end
+      if options.key?(:considerRegionSeleniumElements)
+        options[:consider_region_selenium_elements] =
+          options.delete(:considerRegionSeleniumElements)
+      end
+
+      ignore_region_elements =
+        get_element_ids(options.delete(:ignore_region_selenium_elements) || [])
+      consider_region_elements =
+        get_element_ids(options.delete(:consider_region_selenium_elements) || [])
+
+      options[:ignore_region_elements] = ignore_region_elements
+      options[:consider_region_elements] = consider_region_elements
+
+      response = fetch('percy/automateScreenshot',
+        client_info: CLIENT_INFO,
+        environment_info: ENV_INFO,
+        sessionId: metadata.session_id,
+        commandExecutorUrl: metadata.command_executor_url,
+        capabilities: metadata.capabilities,
+        snapshotName: name,
+        options: options,)
+
+      body = JSON.parse(response.body)
+      unless body['success']
+        raise StandardError, body['error']
+      end
+
+      body['data']
+    rescue StandardError => e
+      log("Could not take Screenshot '#{name}'")
+      log(e, 'debug')
+    end
+  end
+
+  def self.get_driver_metadata(driver)
+    DriverMetaData.new(driver)
+  end
+
+  def self.get_element_ids(elements)
+    elements.map(&:id)
+  end
+
   def self._clear_cache!
     @percy_dom = nil
     @percy_enabled = nil
-    @eligible_widths = nil
     @cli_config = nil
+    @session_type = nil
+    Cache.clear_cache!
   end
 end
