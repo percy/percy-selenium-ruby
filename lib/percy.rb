@@ -113,8 +113,44 @@ module Percy
     driver.manage
   end
 
+  # Readiness gate (PER-7348): runs PercyDOM.waitForReady via
+  # execute_async_script BEFORE serialize. Graceful on old CLIs that lack the
+  # method. Returns readiness diagnostics (or nil) for attachment to domSnapshot.
+  #
+  # Config precedence: options[:readiness] / options['readiness'] >
+  # @cli_config.snapshot.readiness > {} (CLI applies balanced default).
+  # preset='disabled' skips the script call entirely.
+  def self.wait_for_ready(driver, options)
+    readiness_config = options[:readiness] || options['readiness']
+    if readiness_config.nil?
+      readiness_config = @cli_config&.dig('snapshot', 'readiness') || {}
+    end
+    return nil if readiness_config.is_a?(Hash) && readiness_config['preset'] == 'disabled'
+    return nil if readiness_config.is_a?(Hash) && readiness_config[:preset] == 'disabled'
+    begin
+      script = <<~JS
+        var cfg = #{readiness_config.to_json};
+        var done = arguments[arguments.length - 1];
+        try {
+          if (typeof PercyDOM !== 'undefined' && typeof PercyDOM.waitForReady === 'function') {
+            PercyDOM.waitForReady(cfg).then(function(r){ done(r); }).catch(function(){ done(); });
+          } else { done(); }
+        } catch (e) { done(); }
+      JS
+      driver.execute_async_script(script)
+    rescue StandardError => e
+      log("waitForReady failed, proceeding to serialize: #{e}", 'debug')
+      nil
+    end
+  end
+
   def self.get_serialized_dom(driver, options, percy_dom_script: nil)
+    # Readiness gate before serialize (PER-7348). Graceful on old CLI.
+    readiness_diagnostics = wait_for_ready(driver, options)
     dom_snapshot = driver.execute_script("return PercyDOM.serialize(#{options.to_json})")
+    if readiness_diagnostics && dom_snapshot.is_a?(Hash)
+      dom_snapshot['readiness_diagnostics'] = readiness_diagnostics
+    end
     begin
       page_origin = get_origin(driver.current_url)
       iframes = percy_dom_script ? driver.find_elements(:tag_name, 'iframe') : []

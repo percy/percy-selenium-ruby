@@ -748,6 +748,59 @@ RSpec.describe Percy do
       expect(dom['corsIframes'].length).to eq(1)
       expect(dom['corsIframes'][0]['frameUrl']).to eq('https://other.example.com/page')
     end
+
+    # --- Readiness gate (PER-7348) --------------------------------------
+
+    it 'runs waitForReady before serialize and attaches diagnostics' do
+      allow(driver).to receive(:execute_async_script).and_return(
+        'ok' => true, 'timed_out' => false
+      )
+      allow(driver).to receive(:execute_script).and_return({'html' => '<html/>'})
+      allow(driver).to receive(:current_url).and_return('http://main.example.com/')
+      allow(driver).to receive(:find_elements).and_return([])
+
+      dom = Percy.get_serialized_dom(driver, {})
+      expect(driver).to have_received(:execute_async_script) do |script|
+        expect(script).to include('waitForReady')
+        expect(script).to include("typeof PercyDOM.waitForReady === 'function'")
+      end
+      expect(dom['readiness_diagnostics']).to eq('ok' => true, 'timed_out' => false)
+    end
+
+    it 'embeds per-snapshot readiness config in the script' do
+      allow(driver).to receive(:execute_async_script).and_return(nil)
+      allow(driver).to receive(:execute_script).and_return({'html' => '<html/>'})
+      allow(driver).to receive(:current_url).and_return('http://main.example.com/')
+      allow(driver).to receive(:find_elements).and_return([])
+
+      Percy.get_serialized_dom(driver, { readiness: { preset: 'strict', stabilityWindowMs: 500 } })
+      expect(driver).to have_received(:execute_async_script) do |script|
+        expect(script).to include('"preset":"strict"')
+        expect(script).to include('"stabilityWindowMs":500')
+      end
+    end
+
+    it 'skips execute_async_script when preset is disabled' do
+      allow(driver).to receive(:execute_script).and_return({'html' => '<html/>'})
+      allow(driver).to receive(:current_url).and_return('http://main.example.com/')
+      allow(driver).to receive(:find_elements).and_return([])
+      expect(driver).to_not receive(:execute_async_script)
+
+      dom = Percy.get_serialized_dom(driver, { readiness: { preset: 'disabled' } })
+      expect(dom).to_not have_key('readiness_diagnostics')
+      expect(dom['html']).to eq('<html/>')
+    end
+
+    it 'still serializes when execute_async_script raises' do
+      allow(driver).to receive(:execute_async_script).and_raise(StandardError, 'readiness boom')
+      allow(driver).to receive(:execute_script).and_return({'html' => '<html/>'})
+      allow(driver).to receive(:current_url).and_return('http://main.example.com/')
+      allow(driver).to receive(:find_elements).and_return([])
+
+      dom = Percy.get_serialized_dom(driver, {})
+      expect(dom).to_not have_key('readiness_diagnostics')
+      expect(dom['html']).to eq('<html/>')
+    end
   end
 
   describe '.change_window_dimension_and_wait' do
