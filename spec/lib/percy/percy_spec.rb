@@ -820,6 +820,39 @@ RSpec.describe Percy do
       expect(dom['cookies']).to eq(cookies_data)
     end
 
+    it 'preserves partial capture when PercyContextLost is raised mid-walk' do
+      frame_a = double('frame_a')
+      frame_b = double('frame_b')
+
+      partial = [{
+        'iframeData' => {'percyElementId' => 'partial-id'},
+        'iframeSnapshot' => {'html' => '<partial/>'},
+        'frameUrl' => 'https://partial.example.com/',
+      }]
+      err = Percy::PercyContextLost.new('lost context mid-walk')
+      err.partial_capture = partial
+
+      script_calls = 0
+      allow(driver).to receive(:execute_script) do |script|
+        script_calls += 1
+        if script_calls == 1
+          {'html' => '<html/>'}
+        elsif script.include?('querySelectorAll')
+          [
+            iframe_meta(src: 'https://a.example.com/x', percy_id: 'cid-a'),
+            iframe_meta(src: 'https://b.example.com/y', percy_id: 'cid-b'),
+          ]
+        end
+      end
+      allow(driver).to receive(:current_url).and_return('http://main.example.com/')
+      allow(driver).to receive(:find_elements).with(css: 'iframe').and_return([frame_a, frame_b])
+      # First frame raises PercyContextLost with partial capture
+      allow(Percy).to receive(:process_frame_tree).and_raise(err)
+
+      dom = Percy.get_serialized_dom(driver, {}, percy_dom_script: 'script')
+      expect(dom['corsIframes']).to eq(partial)
+    end
+
     it 'skips iframes matching ignoreIframeSelectors option' do
       frame = double('frame')
       captured_selectors = nil
