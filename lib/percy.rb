@@ -1,11 +1,31 @@
 require 'uri'
 require 'json'
+require 'set'
 require 'version'
 require 'net/http'
 require 'selenium-webdriver'
 require_relative 'driver_metadata'
 
 module Percy
+  # Maximum nesting depth for cross-origin iframe recursion. Bounds the cost
+  # of pathological pages and prevents runaway recursion on cyclic frame trees.
+  DEFAULT_MAX_FRAME_DEPTH = 5
+
+  # Iframe src prefixes / sentinels we never attempt to switch into — these
+  # represent either browser-internal documents, non-HTTP URI schemes, or
+  # placeholder values that have no meaningful CORS content to capture.
+  UNSUPPORTED_IFRAME_SRCS = %w[
+    about:blank about:srcdoc javascript: data: vbscript: blob: chrome: chrome-extension: blank
+  ].freeze
+
+  # Raised when a nested-frame restoration step fails and we can no longer
+  # trust that subsequent driver.switch_to / find_elements calls will resolve
+  # against the correct frame context. Carries any iframes captured before
+  # the loss so the caller can still preserve partial work.
+  class PercyContextLost < StandardError
+    attr_accessor :partial_capture
+  end
+
   CLIENT_INFO = "percy-selenium-ruby/#{VERSION}".freeze
   ENV_INFO = "selenium/#{Selenium::WebDriver::VERSION} ruby/#{RUBY_VERSION}".freeze
 
@@ -151,9 +171,19 @@ module Percy
     dom_snapshot
   end
 
+  # Inlined helper: returns true for srcs we should never attempt to switch
+  # into (browser-internal, non-HTTP schemes, or placeholders). Also used
+  # post-switch on document.URL to catch about:blank / error-page redirects
+  # that aren't visible in the static src attribute.
+  def self.is_unsupported_iframe_src?(src)
+    return true if src.nil? || src.to_s.empty?
+
+    UNSUPPORTED_IFRAME_SRCS.any? { |prefix| src == prefix || src.start_with?(prefix) }
+  end
+
+  # Backwards-compatible alias for the original method name.
   def self.unsupported_iframe_src?(src)
-    src.nil? || src.empty? || src == 'about:blank' ||
-      src.start_with?('javascript:') || src.start_with?('data:') || src.start_with?('vbscript:')
+    is_unsupported_iframe_src?(src)
   end
 
   def self.get_origin(url)
@@ -164,6 +194,75 @@ module Percy
     default_ports = {'http' => 80, 'https' => 443}
     netloc += ":#{uri.port}" if uri.port && uri.port != default_ports[uri.scheme]
     "#{uri.scheme}://#{netloc}"
+  end
+
+  # Clamp a user-supplied iframe depth to a sane range. Negative or non-numeric
+  # input falls back to the default; very large values are capped to avoid
+  # unbounded recursion on degenerate pages.
+  def self.clamp_frame_depth(depth, default: DEFAULT_MAX_FRAME_DEPTH)
+    return default if depth.nil?
+
+    n = Integer(depth) rescue nil
+    return default if n.nil?
+    return 0 if n < 0
+
+    [n, 50].min
+  end
+
+  # Accept selector input as String, Array, or nil and produce a flat array of
+  # non-empty strings. Lets the user pass either a single selector or many.
+  def self.normalize_ignore_selectors(input)
+    return [] if input.nil?
+
+    arr = input.is_a?(Array) ? input : [input]
+    arr.flat_map { |s| s.is_a?(Array) ? s : [s] }
+       .reject { |s| s.nil? || s.to_s.strip.empty? }
+       .map(&:to_s)
+  end
+
+  def self.resolve_max_frame_depth(options, config = nil)
+    val = options[:maxIframeDepth] || options[:max_iframe_depth] ||
+      config&.dig('snapshot', 'maxIframeDepth')
+    clamp_frame_depth(val)
+  end
+
+  def self.resolve_ignore_selectors(options, config = nil)
+    val = options[:ignoreIframeSelectors] || options[:ignore_iframe_selectors] ||
+      config&.dig('snapshot', 'ignoreIframeSelectors') || []
+    normalize_ignore_selectors(val)
+  end
+
+  # Browser-side script that enumerates all <iframe> elements and returns a
+  # plain-data array describing each, including data-percy-ignore attribute
+  # state and which configured ignoreIframeSelectors it matches. We do all
+  # filtering off this snapshot rather than re-querying the DOM repeatedly.
+  def self.enumerate_iframes_script(selectors)
+    selectors_json = (selectors || []).to_json
+    <<~JS
+      (function() {
+        var selectors = #{selectors_json};
+        var iframes = document.querySelectorAll('iframe');
+        var result = [];
+        for (var i = 0; i < iframes.length; i++) {
+          var frame = iframes[i];
+          var matchesIgnore = false;
+          if (selectors && selectors.length) {
+            for (var j = 0; j < selectors.length; j++) {
+              try { if (frame.matches(selectors[j])) { matchesIgnore = true; break; } } catch (e) {}
+            }
+          }
+          result.push({
+            src: frame.src || '',
+            srcdoc: frame.getAttribute('srcdoc'),
+            percyElementId: frame.getAttribute('data-percy-element-id'),
+            dataPercyIgnore: frame.hasAttribute('data-percy-ignore'),
+            matchesIgnoreSelector: matchesIgnore,
+            index: i
+          });
+        }
+        return result;
+      })();
+    JS
   end
 
   def self.process_frame(driver, frame_element, options, percy_dom_script)
