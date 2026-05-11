@@ -252,10 +252,21 @@ module Percy
       switched_in = true
 
       driver.execute_script(ctx[:percy_dom_script])
+
+      # Post-switch URL re-check: failed cross-origin navigations land on
+      # about:blank or chrome-error://... in the iframe's *document* context.
+      # The pre-switch shouldSkipIframe filter on meta['src'] can't see this —
+      # the attribute still holds the original https:// URL. Drop these so we
+      # don't ship browser error pages as "captured" content.
+      frame_url = driver.execute_script('return document.URL') rescue meta['src']
+      if is_unsupported_iframe_src?(frame_url)
+        log("Skipping iframe whose document loaded an unsupported URL: #{frame_url}", 'debug')
+        return collected
+      end
+
       iframe_options = (ctx[:serialize_options] || {}).merge('enableJavaScript' => true)
       iframe_snapshot =
         driver.execute_script("return PercyDOM.serialize(#{iframe_options.to_json})")
-      frame_url = driver.execute_script('return document.URL') rescue meta['src']
 
       if iframe_snapshot.nil?
         log("Serialization returned empty result for frame: #{meta['src']}", 'debug')

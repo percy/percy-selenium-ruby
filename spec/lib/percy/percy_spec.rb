@@ -529,14 +529,13 @@ RSpec.describe Percy do
 
     it 'returns a hash with iframeData, iframeSnapshot, and frameUrl on success' do
       meta = meta_for(src: 'https://other.example.com/page', percy_id: 'elem-123')
-      call_count = 0
       allow(driver).to receive(:execute_script) do |script|
-        call_count += 1
-        case call_count
-        when 1 then nil # percy_dom_script injection
-        when 2 then {'html' => '<html/>'} # serialize
-        when 3 then 'https://other.example.com/page' # document.URL
-        else [] # child enumeration
+        if script.include?('document.URL')
+          'https://other.example.com/page'
+        elsif script.include?('PercyDOM.serialize')
+          {'html' => '<html/>'}
+        elsif script.include?('querySelectorAll')
+          []
         end
       end
       allow(driver).to receive(:find_elements).with(css: 'iframe').and_return([])
@@ -568,14 +567,14 @@ RSpec.describe Percy do
     it 'merges enableJavaScript into the PercyDOM.serialize call' do
       meta = meta_for(src: 'https://other.example.com/page', percy_id: 'elem-abc')
       captured_serialize_call = nil
-      call_count = 0
       allow(driver).to receive(:execute_script) do |script|
-        call_count += 1
-        if call_count == 2
+        if script.include?('document.URL')
+          'https://other.example.com/page'
+        elsif script.include?('PercyDOM.serialize')
           captured_serialize_call = script
           {'html' => '<html/>'}
-        elsif call_count == 3
-          'https://other.example.com/page'
+        elsif script.include?('querySelectorAll')
+          []
         end
       end
       allow(driver).to receive(:find_elements).with(css: 'iframe').and_return([])
@@ -611,16 +610,32 @@ RSpec.describe Percy do
       expect(result).to eq([])
     end
 
+    it 'skips frames whose document.URL post-switch is about:blank' do
+      meta = meta_for(src: 'https://other.example.com/error-page', percy_id: 'elem-err')
+      allow(driver).to receive(:execute_script) do |script|
+        if script.include?('document.URL')
+          'about:blank' # cross-origin nav failed, landed on blank
+        elsif script.include?('PercyDOM.serialize')
+          {'html' => '<should-not-capture/>'}
+        elsif script.include?('querySelectorAll')
+          []
+        end
+      end
+      allow(driver).to receive(:find_elements).with(css: 'iframe').and_return([])
+
+      result = Percy.process_frame_tree(driver, frame_element, meta, 1, Set.new, ctx)
+      expect(result).to eq([])
+    end
+
     it 'raises PercyContextLost when parent_frame fails inside a nested frame' do
       meta = meta_for(src: 'https://other.example.com/page', percy_id: 'elem-deep')
-      call_count = 0
-      allow(driver).to receive(:execute_script) do
-        call_count += 1
-        case call_count
-        when 1 then nil
-        when 2 then {'html' => '<deep/>'}
-        when 3 then 'https://other.example.com/page'
-        else []
+      allow(driver).to receive(:execute_script) do |script|
+        if script.include?('document.URL')
+          'https://other.example.com/page'
+        elsif script.include?('PercyDOM.serialize')
+          {'html' => '<deep/>'}
+        elsif script.include?('querySelectorAll')
+          []
         end
       end
       allow(driver).to receive(:find_elements).with(css: 'iframe').and_return([])
