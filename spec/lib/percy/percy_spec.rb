@@ -805,6 +805,24 @@ RSpec.describe Percy do
       expect(dom['cookies']).to eq(cookies_data)
     end
 
+    it 'skips iframes marked with data-percy-ignore' do
+      frame = double('frame')
+      script_calls = 0
+      allow(driver).to receive(:execute_script) do |script|
+        script_calls += 1
+        if script_calls == 1
+          {'html' => '<html/>'}
+        elsif script.include?('querySelectorAll')
+          [iframe_meta(src: 'https://cross.example.com/x', percy_id: 'cid-y', ignore: true)]
+        end
+      end
+      allow(driver).to receive(:current_url).and_return('http://main.example.com/')
+      allow(driver).to receive(:find_elements).with(css: 'iframe').and_return([frame])
+
+      dom = Percy.get_serialized_dom(driver, {}, percy_dom_script: 'script')
+      expect(dom).to_not have_key('corsIframes')
+    end
+
     it 'skips same-origin frame and processes only cross-origin frame' do
       same_frame = double('same_frame')
       cross_frame = double('cross_frame')

@@ -202,6 +202,12 @@ module Percy
 
   def self.should_skip_iframe?(meta, parent_origin)
     src = meta['src']
+    # data-percy-ignore lets page authors opt a single iframe out of capture
+    # without needing a project-wide selector configuration.
+    if meta['dataPercyIgnore']
+      log("Skipping iframe marked with data-percy-ignore: #{src || '(no src)'}", 'debug')
+      return true
+    end
     return true if is_unsupported_iframe_src?(src)
     return true if meta['srcdoc'] && !meta['srcdoc'].to_s.empty?
     return true if meta['percyElementId'].nil? || meta['percyElementId'].to_s.empty?
