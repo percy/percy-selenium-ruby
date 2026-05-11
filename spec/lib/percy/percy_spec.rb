@@ -495,6 +495,83 @@ RSpec.describe Percy do
     end
   end
 
+  describe '.expose_closed_shadow_roots' do
+    let(:driver) { double('driver') }
+
+    before(:each) do
+      allow(Percy).to receive(:log)
+    end
+
+    it 'no-ops when driver does not respond to execute_cdp' do
+      allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(false)
+      expect(driver).to_not receive(:execute_cdp)
+      Percy.expose_closed_shadow_roots(driver)
+    end
+
+    it 'returns silently when DOM.getDocument fails' do
+      allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(true)
+      allow(driver).to receive(:execute_cdp).with('DOM.getDocument', anything)
+        .and_raise(StandardError, 'CDP not available')
+      expect { Percy.expose_closed_shadow_roots(driver) }.to_not raise_error
+    end
+
+    it 'is a no-op when no closed shadow roots are present' do
+      allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(true)
+      allow(driver).to receive(:execute_cdp).with('DOM.getDocument', anything)
+        .and_return({'root' => {'children' => []}})
+      expect(driver).to_not receive(:execute_script)
+      Percy.expose_closed_shadow_roots(driver)
+    end
+
+    it 'walks the tree, resolves both nodes, and registers via Runtime.callFunctionOn' do
+      tree = {
+        'root' => {
+          'backendNodeId' => 1,
+          'children' => [{
+            'backendNodeId' => 2,
+            'shadowRoots' => [{
+              'backendNodeId' => 3,
+              'shadowRootType' => 'closed',
+            }],
+          }],
+        },
+      }
+      allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(true)
+      allow(driver).to receive(:execute_cdp).with('DOM.getDocument', anything).and_return(tree)
+      allow(driver).to receive(:execute_cdp).with('DOM.resolveNode', backendNodeId: 2)
+        .and_return({'object' => {'objectId' => 'host-obj'}})
+      allow(driver).to receive(:execute_cdp).with('DOM.resolveNode', backendNodeId: 3)
+        .and_return({'object' => {'objectId' => 'shadow-obj'}})
+      expect(driver).to receive(:execute_script)
+        .with(/__percyClosedShadowRoots/)
+      expect(driver).to receive(:execute_cdp).with(
+        'Runtime.callFunctionOn',
+        hash_including(objectId: 'host-obj'),
+      )
+      Percy.expose_closed_shadow_roots(driver)
+    end
+
+    it 'skips contentDocument subtrees (cross-frame closed roots not supported)' do
+      tree = {
+        'root' => {
+          'children' => [{
+            'backendNodeId' => 10,
+            'contentDocument' => {
+              'shadowRoots' => [{
+                'backendNodeId' => 11,
+                'shadowRootType' => 'closed',
+              }],
+            },
+          }],
+        },
+      }
+      allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(true)
+      allow(driver).to receive(:execute_cdp).with('DOM.getDocument', anything).and_return(tree)
+      expect(driver).to_not receive(:execute_script)
+      Percy.expose_closed_shadow_roots(driver)
+    end
+  end
+
   describe '.process_frame_tree' do
     let(:driver)        { double('driver') }
     let(:frame_element) { double('frame_element') }
@@ -1072,6 +1149,7 @@ RSpec.describe Percy do
         )
         allow(driver).to receive(:navigate).and_return(navigate)
         allow(navigate).to receive(:refresh)
+        allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(false)
       end
 
       it 'calls driver.navigate.refresh once per width' do

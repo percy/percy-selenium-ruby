@@ -99,6 +99,9 @@ module Percy
     begin
       percy_dom_script = fetch_percy_dom
       driver.execute_script(percy_dom_script)
+      # Expose closed shadow roots via CDP before serialization so PercyDOM
+      # can pierce them. No-op for non-Chromium drivers / when CDP fails.
+      expose_closed_shadow_roots(driver)
       dom_snapshot = if responsive_snapshot_capture?(options)
         capture_responsive_dom(driver, options, percy_dom_script: percy_dom_script)
       else
@@ -122,6 +125,88 @@ module Percy
     rescue StandardError => e
       log("Could not take DOM snapshot '#{name}'")
       log(e, 'debug')
+    end
+  end
+
+  # Use CDP to discover closed shadow roots and expose them to
+  # PercyDOM.serialize(). Closed shadow roots are inaccessible from JavaScript
+  # (element.shadowRoot is null), but CDP's DOM domain can pierce them. For
+  # each closed shadow root we resolve both the host and the shadow root to JS
+  # objects, then store the shadow in a host-keyed WeakMap that clone-dom.js
+  # reads during serialization. Three CDP calls per closed root:
+  # DOM.getDocument (once, deep+pierce), then resolveNode + resolveNode +
+  # Runtime.callFunctionOn per pair. Non-fatal on any failure — closed shadow
+  # DOM simply won't be captured (the existing behavior).
+  def self.expose_closed_shadow_roots(driver)
+    return unless driver.respond_to?(:execute_cdp)
+
+    begin
+      result = driver.execute_cdp('DOM.getDocument', depth: -1, pierce: true)
+    rescue StandardError => e
+      log("CDP unavailable for closed shadow root discovery: #{e}", 'debug')
+      return
+    end
+
+    root = result.is_a?(Hash) ? (result['root'] || result[:root]) : nil
+    return unless root
+
+    closed_pairs = []
+    walker = lambda do |node|
+      return if node.nil?
+      # Skip nodes inside child frame documents — cross-frame closed shadow
+      # roots are not yet supported (their execution context lacks the WeakMap)
+      return if node['contentDocument'] || node[:contentDocument]
+
+      shadow_roots = node['shadowRoots'] || node[:shadowRoots]
+      if shadow_roots.is_a?(Array)
+        shadow_roots.each do |sr|
+          type = sr['shadowRootType'] || sr[:shadowRootType]
+          if type == 'closed'
+            closed_pairs << {
+              host_backend_id: node['backendNodeId'] || node[:backendNodeId],
+              shadow_backend_id: sr['backendNodeId'] || sr[:backendNodeId],
+            }
+          end
+          walker.call(sr)
+        end
+      end
+
+      children = node['children'] || node[:children]
+      children.each(&walker) if children.is_a?(Array)
+    end
+    walker.call(root)
+
+    return if closed_pairs.empty?
+
+    log("Found #{closed_pairs.length} closed shadow root(s), exposing via CDP", 'debug')
+
+    begin
+      driver.execute_script(
+        'window.__percyClosedShadowRoots = window.__percyClosedShadowRoots || new WeakMap();',
+      )
+
+      closed_pairs.each do |pair|
+        host = driver.execute_cdp('DOM.resolveNode', backendNodeId: pair[:host_backend_id])
+        shadow = driver.execute_cdp('DOM.resolveNode', backendNodeId: pair[:shadow_backend_id])
+        host_obj = host.is_a?(Hash) ? (host['object'] || host[:object]) : nil
+        shadow_obj = shadow.is_a?(Hash) ? (shadow['object'] || shadow[:object]) : nil
+        next unless host_obj && shadow_obj
+
+        host_id = host_obj['objectId'] || host_obj[:objectId]
+        shadow_id = shadow_obj['objectId'] || shadow_obj[:objectId]
+        next unless host_id && shadow_id
+
+        driver.execute_cdp(
+          'Runtime.callFunctionOn',
+          functionDeclaration:
+            'function(shadowRoot) { window.__percyClosedShadowRoots.set(this, shadowRoot); }',
+          objectId: host_id,
+          arguments: [{objectId: shadow_id}],
+        )
+      end
+    rescue StandardError => e
+      # Non-fatal — closed shadow DOM just won't be captured
+      log("Could not expose closed shadow roots via CDP: #{e}", 'debug')
     end
   end
 
@@ -528,6 +613,9 @@ module Percy
           end
           percy_dom_script = fetch_percy_dom
           driver.execute_script(percy_dom_script)
+          # Re-prime the closed-shadow-root WeakMap — page.refresh creates a
+          # new document and erases window.__percyClosedShadowRoots.
+          expose_closed_shadow_roots(driver)
           driver.execute_script('PercyDOM.waitForResize()')
           resize_count = 0
         end
