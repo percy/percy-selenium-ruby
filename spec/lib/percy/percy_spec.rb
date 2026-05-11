@@ -948,7 +948,7 @@ RSpec.describe Percy do
       allow(driver).to receive(:find_elements).with(css: 'iframe').and_return([frame])
 
       dom = Percy.get_serialized_dom(driver, {ignoreIframeSelectors: '.ad'},
-                                     percy_dom_script: 'script',)
+        percy_dom_script: 'script',)
       expect(dom).to_not have_key('corsIframes')
       # The selector list flows through to the in-browser script
       expect(captured_selectors).to include('".ad"')
@@ -992,7 +992,8 @@ RSpec.describe Percy do
         end
       end
       allow(driver).to receive(:current_url).and_return('http://main.example.com/')
-      allow(driver).to receive(:find_elements).with(css: 'iframe').and_return([same_frame, cross_frame])
+      allow(driver).to receive(:find_elements).with(css: 'iframe')
+        .and_return([same_frame, cross_frame])
 
       dom = Percy.get_serialized_dom(driver, {}, percy_dom_script: 'script')
       expect(dom['corsIframes'].length).to eq(1)

@@ -11,7 +11,7 @@ module Percy
   # of pathological pages and prevents runaway recursion on cyclic frame trees.
   DEFAULT_MAX_FRAME_DEPTH = 5
 
-  # Iframe src prefixes / sentinels we never attempt to switch into — these
+  # Iframe src prefixes / sentinels we never attempt to switch into -- these
   # represent either browser-internal documents, non-HTTP URI schemes, or
   # placeholder values that have no meaningful CORS content to capture.
   UNSUPPORTED_IFRAME_SRCS = %w[
@@ -135,7 +135,7 @@ module Percy
   # objects, then store the shadow in a host-keyed WeakMap that clone-dom.js
   # reads during serialization. Three CDP calls per closed root:
   # DOM.getDocument (once, deep+pierce), then resolveNode + resolveNode +
-  # Runtime.callFunctionOn per pair. Non-fatal on any failure — closed shadow
+  # Runtime.callFunctionOn per pair. Non-fatal on any failure -- closed shadow
   # DOM simply won't be captured (the existing behavior).
   def self.expose_closed_shadow_roots(driver)
     return unless driver.respond_to?(:execute_cdp)
@@ -153,7 +153,7 @@ module Percy
     closed_pairs = []
     walker = lambda do |node|
       return if node.nil?
-      # Skip nodes inside child frame documents — cross-frame closed shadow
+      # Skip nodes inside child frame documents -- cross-frame closed shadow
       # roots are not yet supported (their execution context lacks the WeakMap)
       return if node['contentDocument'] || node[:contentDocument]
 
@@ -205,7 +205,7 @@ module Percy
         )
       end
     rescue StandardError => e
-      # Non-fatal — closed shadow DOM just won't be captured
+      # Non-fatal -- closed shadow DOM just won't be captured
       log("Could not expose closed shadow roots via CDP: #{e}", 'debug')
     end
   end
@@ -244,7 +244,11 @@ module Percy
   # iteration but preserves whatever we already captured.
   def self.capture_cors_iframes(driver, ctx)
     page_url = driver.current_url
-    page_origin = get_origin(page_url) rescue nil
+    page_origin = begin
+                    get_origin(page_url)
+                  rescue StandardError
+                    nil
+                  end
     iframes_meta = enumerate_iframes(driver, ctx[:ignore_selectors])
     return [] if iframes_meta.empty?
 
@@ -257,7 +261,7 @@ module Percy
 
       begin
         entries = process_frame_tree(driver, element, meta, 1,
-                                     Set.new([page_url].compact), ctx,)
+          Set.new([page_url].compact), ctx,)
         cors.concat(entries) if entries.any?
       rescue PercyContextLost => e
         log('Aborting further nested CORS capture due to lost frame context', 'debug')
@@ -293,7 +297,7 @@ module Percy
       log("Skipping iframe marked with data-percy-ignore: #{src || '(no src)'}", 'debug')
       return true
     end
-    # ignoreIframeSelectors is project- or call-level config — selector match
+    # ignoreIframeSelectors is project- or call-level config -- selector match
     # is computed in-browser by enumerate_iframes_script against the page's
     # current DOM, so we just trust the flag here.
     if meta['matchesIgnoreSelector']
@@ -304,7 +308,11 @@ module Percy
     return true if meta['srcdoc'] && !meta['srcdoc'].to_s.empty?
     return true if meta['percyElementId'].nil? || meta['percyElementId'].to_s.empty?
 
-    frame_origin = get_origin(src) rescue nil
+    frame_origin = begin
+                     get_origin(src)
+                   rescue StandardError
+                     nil
+                   end
     return true if frame_origin.nil?
     return true if frame_origin == parent_origin
 
@@ -340,10 +348,14 @@ module Percy
 
       # Post-switch URL re-check: failed cross-origin navigations land on
       # about:blank or chrome-error://... in the iframe's *document* context.
-      # The pre-switch shouldSkipIframe filter on meta['src'] can't see this —
+      # The pre-switch shouldSkipIframe filter on meta['src'] can't see this --
       # the attribute still holds the original https:// URL. Drop these so we
       # don't ship browser error pages as "captured" content.
-      frame_url = driver.execute_script('return document.URL') rescue meta['src']
+      frame_url = begin
+                    driver.execute_script('return document.URL')
+                  rescue StandardError
+                    meta['src']
+                  end
       if is_unsupported_iframe_src?(frame_url)
         log("Skipping iframe whose document loaded an unsupported URL: #{frame_url}", 'debug')
         return collected
@@ -366,7 +378,11 @@ module Percy
       log("Captured cross-origin iframe (depth #{depth}): #{frame_url || meta['src']}", 'debug')
 
       if depth < ctx[:max_frame_depth]
-        current_origin = get_origin(frame_url || meta['src']) rescue nil
+        current_origin = begin
+                           get_origin(frame_url || meta['src'])
+                         rescue StandardError
+                           nil
+                         end
         child_metas = enumerate_iframes(driver, ctx[:ignore_selectors])
         child_elements = driver.find_elements(css: 'iframe')
         next_ancestors = ancestor_urls.dup
@@ -378,7 +394,7 @@ module Percy
           next if should_skip_iframe?(child_meta, current_origin)
 
           nested = process_frame_tree(driver, child_element, child_meta, depth + 1,
-                                      next_ancestors, ctx,)
+            next_ancestors, ctx,)
           collected.concat(nested) if nested.any?
         end
       end
@@ -399,25 +415,27 @@ module Percy
       if switched_in
         # Step up exactly one level so an outer recursion continues from its
         # own context. If parent_frame fails we have no reliable way to land
-        # in the correct parent — fall back to default_content and, if this
+        # in the correct parent -- fall back to default_content and, if this
         # happened inside a nested frame, raise PercyContextLost so the
         # caller stops iterating siblings whose enumeration was performed in
         # a now-lost context.
         begin
           driver.switch_to.parent_frame
-        rescue StandardError => parent_err
-          log("Failed to switch back to parent frame: #{parent_err}", 'debug')
+        rescue StandardError => e
+          log("Failed to switch back to parent frame: #{e}", 'debug')
           begin
             driver.switch_to.default_content
           rescue StandardError
             nil
           end
+          # rubocop:disable Metrics/BlockNesting
           if depth > 1
-            err = PercyContextLost.new("Lost parent frame context: #{parent_err.message}")
+            err = PercyContextLost.new("Lost parent frame context: #{e.message}")
             err.partial_capture = collected
             err.set_backtrace(captured_error.backtrace) if captured_error
             raise err
           end
+          # rubocop:enable Metrics/BlockNesting
         end
       end
     end
@@ -427,11 +445,13 @@ module Percy
   # into (browser-internal, non-HTTP schemes, or placeholders). Also used
   # post-switch on document.URL to catch about:blank / error-page redirects
   # that aren't visible in the static src attribute.
+  # rubocop:disable Naming/PredicateName
   def self.is_unsupported_iframe_src?(src)
     return true if src.nil? || src.to_s.empty?
 
     UNSUPPORTED_IFRAME_SRCS.any? { |prefix| src == prefix || src.start_with?(prefix) }
   end
+  # rubocop:enable Naming/PredicateName
 
   # Backwards-compatible alias for the original method name.
   def self.unsupported_iframe_src?(src)
@@ -454,7 +474,11 @@ module Percy
   def self.clamp_frame_depth(depth, default: DEFAULT_MAX_FRAME_DEPTH)
     return default if depth.nil?
 
-    n = Integer(depth) rescue nil
+    n = begin
+          Integer(depth)
+        rescue StandardError
+          nil
+        end
     return default if n.nil?
     return 0 if n < 0
 
@@ -468,8 +492,8 @@ module Percy
 
     arr = input.is_a?(Array) ? input : [input]
     arr.flat_map { |s| s.is_a?(Array) ? s : [s] }
-       .reject { |s| s.nil? || s.to_s.strip.empty? }
-       .map(&:to_s)
+      .reject { |s| s.nil? || s.to_s.strip.empty? }
+      .map(&:to_s)
   end
 
   def self.resolve_max_frame_depth(options, config = nil)
@@ -516,7 +540,6 @@ module Percy
       })();
     JS
   end
-
 
   def self.get_responsive_widths(widths = [])
     begin
@@ -613,7 +636,7 @@ module Percy
           end
           percy_dom_script = fetch_percy_dom
           driver.execute_script(percy_dom_script)
-          # Re-prime the closed-shadow-root WeakMap — page.refresh creates a
+          # Re-prime the closed-shadow-root WeakMap -- page.refresh creates a
           # new document and erases window.__percyClosedShadowRoots.
           expose_closed_shadow_roots(driver)
           driver.execute_script('PercyDOM.waitForResize()')
