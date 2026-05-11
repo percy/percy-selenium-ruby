@@ -208,6 +208,13 @@ module Percy
       log("Skipping iframe marked with data-percy-ignore: #{src || '(no src)'}", 'debug')
       return true
     end
+    # ignoreIframeSelectors is project- or call-level config — selector match
+    # is computed in-browser by enumerate_iframes_script against the page's
+    # current DOM, so we just trust the flag here.
+    if meta['matchesIgnoreSelector']
+      log("Skipping iframe matching ignoreIframeSelectors: #{src || '(no src)'}", 'debug')
+      return true
+    end
     return true if is_unsupported_iframe_src?(src)
     return true if meta['srcdoc'] && !meta['srcdoc'].to_s.empty?
     return true if meta['percyElementId'].nil? || meta['percyElementId'].to_s.empty?
