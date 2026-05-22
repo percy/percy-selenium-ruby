@@ -85,7 +85,7 @@ module Percy
         get_serialized_dom(driver, options, percy_dom_script: percy_dom_script)
       end
 
-      # Strip `readiness` before POSTing — SDK-local config that the CLI
+      # Strip `readiness` before POSTing -- SDK-local config that the CLI
       # already has via healthcheck.
       post_options = options.reject { |k, _| k.to_s == 'readiness' }
       response = fetch('percy/snapshot',
@@ -180,7 +180,7 @@ module Percy
   def self.get_serialized_dom(driver, options, percy_dom_script: nil)
     # Readiness gate before serialize (PER-7348). Graceful on old CLI.
     readiness_diagnostics = wait_for_ready(driver, options)
-    # Strip `readiness` from forwarded serialize args — it's consumed by
+    # Strip `readiness` from forwarded serialize args -- it's consumed by
     # wait_for_ready upstream, not a PercyDOM.serialize argument.
     serialize_options = options.reject { |k, _| k.to_s == 'readiness' }
     dom_snapshot = driver.execute_script("return PercyDOM.serialize(#{serialize_options.to_json})")
