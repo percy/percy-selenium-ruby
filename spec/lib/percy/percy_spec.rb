@@ -773,7 +773,7 @@ RSpec.describe Percy do
       allow(driver).to receive(:current_url).and_return('http://main.example.com/')
       allow(driver).to receive(:find_elements).and_return([])
 
-      Percy.get_serialized_dom(driver, readiness: { preset: 'strict', stabilityWindowMs: 500 })
+      Percy.get_serialized_dom(driver, readiness: {preset: 'strict', stabilityWindowMs: 500})
       expect(driver).to have_received(:execute_async_script) do |script| # rubocop:disable RSpec/MessageSpies
         expect(script).to include('"preset":"strict"')
         expect(script).to include('"stabilityWindowMs":500')
@@ -786,7 +786,7 @@ RSpec.describe Percy do
       allow(driver).to receive(:find_elements).and_return([])
       expect(driver).to_not receive(:execute_async_script)
 
-      dom = Percy.get_serialized_dom(driver, readiness: { preset: 'disabled' })
+      dom = Percy.get_serialized_dom(driver, readiness: {preset: 'disabled'})
       expect(dom).to_not have_key('readiness_diagnostics')
       expect(dom['html']).to eq('<html/>')
     end
