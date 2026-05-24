@@ -760,6 +760,52 @@ RSpec.describe Percy do
       expect(result).to eq([])
     end
 
+    it 'resolves nested child iframes by percyElementId (not by index)' do
+      # Regression: the child-level lookup must use find_element with the
+      # data-percy-element-id selector, matching the same stable-id contract
+      # used at the top level. A positional alignment against
+      # find_elements(:tag_name, 'iframe') would silently mis-pair meta to
+      # element if the DOM mutated between enumerate_iframes and find_elements.
+      meta = meta_for(src: 'https://other.example.com/parent', percy_id: 'parent-id')
+      child_meta = {
+        'src' => 'https://third.example.com/child',
+        'srcdoc' => nil,
+        'percyElementId' => 'child-pid',
+        'dataPercyIgnore' => false,
+        'matchesIgnoreSelector' => false,
+        'index' => 0,
+      }
+
+      allow(driver).to receive(:execute_script) do |script|
+        if script.include?('document.URL')
+          'https://other.example.com/parent'
+        elsif script.include?('PercyDOM.serialize')
+          {'html' => '<parent/>'}
+        elsif script.include?('querySelectorAll') || script.include?('iframe')
+          [child_meta]
+        end
+      end
+
+      child_element = double('child_element')
+      expect(driver).to_not receive(:find_elements)
+      expect(driver).to receive(:find_element)
+        .with(css: 'iframe[data-percy-element-id="child-pid"]')
+        .and_return(child_element)
+
+      # Short-circuit the recursive descent into the child so we only verify
+      # the child-level lookup path.
+      original = Percy.method(:process_frame_tree)
+      allow(Percy).to receive(:process_frame_tree).and_wrap_original do |_m, *args|
+        if args[1] == child_element
+          []
+        else
+          original.call(*args)
+        end
+      end
+
+      Percy.process_frame_tree(driver, frame_element, meta, 1, Set.new, ctx)
+    end
+
     it 'raises PercyContextLost when parent_frame fails inside a nested frame' do
       meta = meta_for(src: 'https://other.example.com/page', percy_id: 'elem-deep')
       allow(driver).to receive(:execute_script) do |script|
@@ -779,6 +825,29 @@ RSpec.describe Percy do
       }.to raise_error(Percy::PercyContextLost) { |err|
         expect(err.partial_capture.length).to eq(1)
       }
+    end
+  end
+
+  describe 'Percy::PercyContextLost' do
+    # Regression: previous code paths could overwrite the original backtrace
+    # by re-raising a new error. The exception's backtrace must point at the
+    # raise site, not nil and not at the rescue site.
+    it 'preserves the original backtrace when raised then rescued' do
+      raised_line = nil
+      err = nil
+      begin
+        raised_line = __LINE__ + 1
+        raise Percy::PercyContextLost, 'simulated context loss'
+      rescue Percy::PercyContextLost => e
+        err = e
+      end
+
+      expect(err).to be_a(Percy::PercyContextLost)
+      expect(err.backtrace).to_not be_nil
+      expect(err.backtrace).to_not be_empty
+      # The top frame of the backtrace should point at the raise line in this file
+      expect(err.backtrace.first).to include(__FILE__)
+      expect(err.backtrace.first).to include(":#{raised_line}:")
     end
   end
 
