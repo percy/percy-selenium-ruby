@@ -304,7 +304,9 @@ module Percy
     # and double-quotes defensively so a non-UUID id can't break the selector
     # or open an injection vector. Anything beyond that which still trips the
     # parser falls through to the rescue below and returns nil.
-    escaped = percy_element_id.to_s.gsub('\\', '\\\\\\\\').gsub('"', '\\"')
+    # Single-pass escape so backslash and quote escaping can't tangle: each
+    # match is replaced with itself prefixed by a backslash.
+    escaped = percy_element_id.to_s.gsub(/[\\"]/) { |c| "\\#{c}" }
     driver.find_element(css: %(iframe[data-percy-element-id="#{escaped}"]))
   rescue StandardError => e
     log("Could not locate iframe by percyElementId #{percy_element_id}: #{e}", 'debug')
