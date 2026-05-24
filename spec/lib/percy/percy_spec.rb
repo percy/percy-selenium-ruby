@@ -491,6 +491,30 @@ RSpec.describe Percy do
         .and_raise(Selenium::WebDriver::Error::NoSuchElementError.new('no match'))
       expect(Percy.find_iframe_by_percy_id(driver, 'missing-id')).to be_nil
     end
+
+    it 'CSS-escapes embedded double-quotes and backslashes in percyElementId' do
+      # Defensive hardening: if a percyElementId ever leaks an unescaped quote
+      # or backslash, the selector should be escaped rather than broken (or
+      # injectable). If the underlying driver still can't resolve it, the
+      # rescue path returns nil cleanly without raising.
+      element = instance_double('Selenium::WebDriver::Element')
+      expect(driver).to receive(:find_element)
+        .with(css: 'iframe[data-percy-element-id="abc\\\\def\\"ghi"]')
+        .and_return(element)
+
+      expect {
+        result = Percy.find_iframe_by_percy_id(driver, 'abc\\def"ghi')
+        expect(result).to eq(element)
+      }.to_not raise_error
+    end
+
+    it 'returns nil cleanly when an escaped lookup still fails' do
+      allow(driver).to receive(:find_element)
+        .and_raise(Selenium::WebDriver::Error::NoSuchElementError.new('no match'))
+      expect {
+        expect(Percy.find_iframe_by_percy_id(driver, 'weird"id\\value')).to be_nil
+      }.to_not raise_error
+    end
   end
 
   describe '.get_origin' do

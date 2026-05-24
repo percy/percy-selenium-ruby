@@ -300,8 +300,12 @@ module Percy
 
     # CSS attribute selectors don't accept arbitrary unescaped quotes; the
     # percyElementId is a UUID-like value emitted by PercyDOM, so a simple
-    # equality match is sufficient in practice.
-    driver.find_element(css: %(iframe[data-percy-element-id="#{percy_element_id}"]))
+    # equality match is sufficient in practice. We still CSS-escape backslashes
+    # and double-quotes defensively so a non-UUID id can't break the selector
+    # or open an injection vector. Anything beyond that which still trips the
+    # parser falls through to the rescue below and returns nil.
+    escaped = percy_element_id.to_s.gsub('\\', '\\\\\\\\').gsub('"', '\\"')
+    driver.find_element(css: %(iframe[data-percy-element-id="#{escaped}"]))
   rescue StandardError => e
     log("Could not locate iframe by percyElementId #{percy_element_id}: #{e}", 'debug')
     nil
