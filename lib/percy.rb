@@ -436,7 +436,7 @@ module Percy
         # caller stops iterating siblings whose enumeration was performed in
         # a now-lost context.
         begin
-                    driver.switch_to.parent_frame
+          driver.switch_to.parent_frame
         rescue StandardError => e
           log("Failed to switch back to parent frame: #{e}", 'debug')
           begin
@@ -449,7 +449,7 @@ module Percy
             err.partial_capture = collected
             raise err
           end
-                  end
+        end
       end
     end
   end
