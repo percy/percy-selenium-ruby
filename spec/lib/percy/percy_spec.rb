@@ -459,6 +459,38 @@ RSpec.describe Percy do
     it 'returns false for a relative url' do
       expect(Percy.unsupported_iframe_src?('/embed.html')).to be false
     end
+
+    it 'returns false for a src whose first segment is the literal "blank"' do
+      # Regression: the previous UNSUPPORTED_IFRAME_SRCS list contained the bare
+      # token "blank", which matched any src starting with "blank" (e.g.
+      # blanket.com/...). The about:blank case stays covered by the explicit
+      # about:blank entry.
+      expect(Percy.unsupported_iframe_src?('https://blanket.com/page')).to be false
+      expect(Percy.unsupported_iframe_src?('blank-canvas://x')).to be false
+    end
+  end
+
+  describe '.find_iframe_by_percy_id' do
+    let(:driver) { instance_double('Selenium::WebDriver::Driver') }
+
+    it 'returns nil when percyElementId is nil or empty' do
+      expect(Percy.find_iframe_by_percy_id(driver, nil)).to be_nil
+      expect(Percy.find_iframe_by_percy_id(driver, '')).to be_nil
+    end
+
+    it 'queries the driver via the data-percy-element-id attribute selector' do
+      element = instance_double('Selenium::WebDriver::Element')
+      expect(driver).to receive(:find_element)
+        .with(css: 'iframe[data-percy-element-id="abc-123"]')
+        .and_return(element)
+      expect(Percy.find_iframe_by_percy_id(driver, 'abc-123')).to eq(element)
+    end
+
+    it 'returns nil when the lookup raises (no matching element)' do
+      allow(driver).to receive(:find_element)
+        .and_raise(Selenium::WebDriver::Error::NoSuchElementError.new('no match'))
+      expect(Percy.find_iframe_by_percy_id(driver, 'missing-id')).to be_nil
+    end
   end
 
   describe '.get_origin' do
@@ -786,7 +818,8 @@ RSpec.describe Percy do
         end
       end
       allow(driver).to receive(:current_url).and_return('http://main.example.com/')
-      allow(driver).to receive(:find_elements).with(css: 'iframe').and_return([frame])
+      allow(driver).to receive(:find_element)
+        .with(css: 'iframe[data-percy-element-id="cid-1"]').and_return(frame)
 
       dom = Percy.get_serialized_dom(driver, {}, percy_dom_script: 'percy_dom_script')
 
@@ -858,7 +891,8 @@ RSpec.describe Percy do
         end
       end
       allow(driver).to receive(:current_url).and_return('http://main.example.com/')
-      allow(driver).to receive(:find_elements).with(css: 'iframe').and_return([frame])
+      allow(driver).to receive(:find_element)
+        .with(css: 'iframe[data-percy-element-id="percy-id-1"]').and_return(frame)
 
       dom = Percy.get_serialized_dom(driver, {}, percy_dom_script: 'script')
       expect(dom).to have_key('corsIframes')
@@ -880,7 +914,8 @@ RSpec.describe Percy do
         end
       end
       allow(driver).to receive(:current_url).and_return('http://main.example.com:3000/')
-      allow(driver).to receive(:find_elements).with(css: 'iframe').and_return([frame])
+      allow(driver).to receive(:find_element)
+        .with(css: 'iframe[data-percy-element-id="percy-id-port"]').and_return(frame)
 
       dom = Percy.get_serialized_dom(driver, {}, percy_dom_script: 'script')
       expect(dom).to have_key('corsIframes')
@@ -922,7 +957,10 @@ RSpec.describe Percy do
         end
       end
       allow(driver).to receive(:current_url).and_return('http://main.example.com/')
-      allow(driver).to receive(:find_elements).with(css: 'iframe').and_return([frame_a, frame_b])
+      allow(driver).to receive(:find_element)
+        .with(css: 'iframe[data-percy-element-id="cid-a"]').and_return(frame_a)
+      allow(driver).to receive(:find_element)
+        .with(css: 'iframe[data-percy-element-id="cid-b"]').and_return(frame_b)
       # First frame raises PercyContextLost with partial capture
       allow(Percy).to receive(:process_frame_tree).and_raise(err)
 
@@ -973,7 +1011,6 @@ RSpec.describe Percy do
     end
 
     it 'skips same-origin frame and processes only cross-origin frame' do
-      same_frame = double('same_frame')
       cross_frame = double('cross_frame')
 
       top_metas = [
@@ -992,8 +1029,8 @@ RSpec.describe Percy do
         end
       end
       allow(driver).to receive(:current_url).and_return('http://main.example.com/')
-      allow(driver).to receive(:find_elements).with(css: 'iframe')
-        .and_return([same_frame, cross_frame])
+      allow(driver).to receive(:find_element)
+        .with(css: 'iframe[data-percy-element-id="cid-x"]').and_return(cross_frame)
 
       dom = Percy.get_serialized_dom(driver, {}, percy_dom_script: 'script')
       expect(dom['corsIframes'].length).to eq(1)
@@ -1575,6 +1612,47 @@ RSpec.describe Percy do
           opts = JSON.parse(req.body)['options']
           opts['sync'] == true && opts['fullPage'] == true
         }.once
+    end
+  end
+end
+
+RSpec.describe Percy do
+  describe '.capture_cors_iframes (lookup by percyElementId)' do
+    let(:driver) { instance_double('Selenium::WebDriver::Driver') }
+
+    before(:each) do
+      allow(driver).to receive(:current_url).and_return('https://example.com/')
+      # enumerate_iframes calls driver.execute_script -- return a same-origin
+      # entry followed by a CORS entry so the loop has something to skip and
+      # something to process.
+      allow(driver).to receive(:execute_script).and_return([
+        {'src' => 'https://example.com/same', 'percyElementId' => 'pid-same'},
+        {'src' => 'https://other.com/cors',   'percyElementId' => 'pid-cors'},
+      ])
+    end
+
+    it 'looks up the iframe element by data-percy-element-id, not by index' do
+      # Regression: positional alignment between the JS enumerate_iframes
+      # result and driver.find_elements(:tag_name, 'iframe') could ship one
+      # iframe's content under another's percyElementId if the DOM mutated
+      # between the two reads. The new code resolves by stable id and never
+      # calls find_elements on the iframe collection.
+      cors_element = instance_double('Selenium::WebDriver::Element')
+
+      expect(driver).to_not receive(:find_elements)
+      expect(driver).to receive(:find_element)
+        .with(css: 'iframe[data-percy-element-id="pid-cors"]')
+        .and_return(cors_element)
+
+      # Short-circuit process_frame_tree so we only verify the lookup path.
+      allow(Percy).to receive(:process_frame_tree).and_return([])
+
+      Percy.capture_cors_iframes(driver, {
+                                   max_frame_depth: 5,
+                                   ignore_selectors: [],
+                                   percy_dom_script: '',
+                                   serialize_options: {},
+                                 },)
     end
   end
 end
