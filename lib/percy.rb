@@ -15,7 +15,7 @@ module Percy
   # represent either browser-internal documents, non-HTTP URI schemes, or
   # placeholder values that have no meaningful CORS content to capture.
   UNSUPPORTED_IFRAME_SRCS = %w[
-    about:blank about:srcdoc javascript: data: vbscript: blob: chrome: chrome-extension: blank
+    about:blank about:srcdoc javascript: data: vbscript: blob: chrome: chrome-extension:
   ].freeze
 
   # Raised when a nested-frame restoration step fails and we can no longer
@@ -252,12 +252,12 @@ module Percy
     iframes_meta = enumerate_iframes(driver, ctx[:ignore_selectors])
     return [] if iframes_meta.empty?
 
-    iframe_elements = driver.find_elements(css: 'iframe')
     cors = []
-    iframes_meta.each_with_index do |meta, i|
-      element = iframe_elements[i]
-      next if element.nil?
+    iframes_meta.each do |meta|
       next if should_skip_iframe?(meta, page_origin)
+
+      element = find_iframe_by_percy_id(driver, meta['percyElementId'])
+      next if element.nil?
 
       begin
         entries = process_frame_tree(driver, element, meta, 1,
@@ -287,6 +287,24 @@ module Percy
   rescue StandardError => e
     log("Failed to enumerate iframes: #{e}", 'debug')
     []
+  end
+
+  # Look up an <iframe> WebElement by its percyElementId (set by PercyDOM.serialize
+  # on the parent document). Using a stable identifier instead of positional
+  # alignment against driver.find_elements(:tag_name, 'iframe') eliminates a
+  # race window where a DOM mutation between the JS enumerate_iframes call and
+  # the Selenium find_elements call would silently shuffle meta -> element
+  # mappings and ship one iframe's content under another's percyElementId.
+  def self.find_iframe_by_percy_id(driver, percy_element_id)
+    return nil if percy_element_id.nil? || percy_element_id.to_s.empty?
+
+    # CSS attribute selectors don't accept arbitrary unescaped quotes; the
+    # percyElementId is a UUID-like value emitted by PercyDOM, so a simple
+    # equality match is sufficient in practice.
+    driver.find_element(css: %(iframe[data-percy-element-id="#{percy_element_id}"]))
+  rescue StandardError => e
+    log("Could not locate iframe by percyElementId #{percy_element_id}: #{e}", 'debug')
+    nil
   end
 
   def self.should_skip_iframe?(meta, parent_origin)
@@ -338,7 +356,6 @@ module Percy
 
     collected = []
     switched_in = false
-    captured_error = nil
 
     begin
       driver.switch_to.frame(iframe_element)
@@ -384,14 +401,14 @@ module Percy
                            nil
                          end
         child_metas = enumerate_iframes(driver, ctx[:ignore_selectors])
-        child_elements = driver.find_elements(css: 'iframe')
         next_ancestors = ancestor_urls.dup
         next_ancestors.add(meta['src'])
         next_ancestors.add(frame_url) if frame_url
-        child_metas.each_with_index do |child_meta, i|
-          child_element = child_elements[i]
-          next if child_element.nil?
+        child_metas.each do |child_meta|
           next if should_skip_iframe?(child_meta, current_origin)
+
+          child_element = find_iframe_by_percy_id(driver, child_meta['percyElementId'])
+          next if child_element.nil?
 
           nested = process_frame_tree(driver, child_element, child_meta, depth + 1,
             next_ancestors, ctx,)
@@ -409,7 +426,6 @@ module Percy
       raise
     rescue StandardError => e
       log("Failed to process cross-origin iframe #{meta['src']}: #{e}", 'debug')
-      captured_error = e
       collected
     ensure
       if switched_in
@@ -420,7 +436,7 @@ module Percy
         # caller stops iterating siblings whose enumeration was performed in
         # a now-lost context.
         begin
-          driver.switch_to.parent_frame
+                    driver.switch_to.parent_frame
         rescue StandardError => e
           log("Failed to switch back to parent frame: #{e}", 'debug')
           begin
@@ -428,15 +444,12 @@ module Percy
           rescue StandardError
             nil
           end
-          # rubocop:disable Metrics/BlockNesting
           if depth > 1
             err = PercyContextLost.new("Lost parent frame context: #{e.message}")
             err.partial_capture = collected
-            err.set_backtrace(captured_error.backtrace) if captured_error
             raise err
           end
-          # rubocop:enable Metrics/BlockNesting
-        end
+                  end
       end
     end
   end
