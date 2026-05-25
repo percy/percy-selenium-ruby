@@ -749,7 +749,7 @@ RSpec.describe Percy do
       expect(dom['corsIframes'][0]['frameUrl']).to eq('https://other.example.com/page')
     end
 
-    # --- Readiness gate (PER-7348) --------------------------------------
+    # --- Readiness gate --------------------------------------
 
     it 'runs waitForReady before serialize and attaches diagnostics' do
       allow(driver).to receive(:execute_async_script).and_return(

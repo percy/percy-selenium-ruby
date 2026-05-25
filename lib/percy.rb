@@ -130,7 +130,7 @@ module Percy
     end
   end
 
-  # Readiness gate (PER-7348): runs PercyDOM.waitForReady via
+  # Readiness gate: runs PercyDOM.waitForReady via
   # execute_async_script BEFORE serialize. Graceful on old CLIs that lack the
   # method. Returns readiness diagnostics (or nil) for attachment to domSnapshot.
   def self.wait_for_ready(driver, options)
@@ -178,7 +178,7 @@ module Percy
   end
 
   def self.get_serialized_dom(driver, options, percy_dom_script: nil)
-    # Readiness gate before serialize (PER-7348). Graceful on old CLI.
+    # Readiness gate before serialize. Graceful on old CLI.
     readiness_diagnostics = wait_for_ready(driver, options)
     # Strip `readiness` from forwarded serialize args -- it's consumed by
     # wait_for_ready upstream, not a PercyDOM.serialize argument.
