@@ -85,13 +85,16 @@ module Percy
         get_serialized_dom(driver, options, percy_dom_script: percy_dom_script)
       end
 
+      # Strip `readiness` before POSTing -- SDK-local config that the CLI
+      # already has via healthcheck.
+      post_options = options.reject { |k, _| k.to_s == 'readiness' }
       response = fetch('percy/snapshot',
         name: name,
         url: driver.current_url,
         dom_snapshot: dom_snapshot,
         client_info: CLIENT_INFO,
         environment_info: ENV_INFO,
-        **options,)
+        **post_options,)
 
       body = JSON.parse(response.body)
       unless body['success']
@@ -113,8 +116,79 @@ module Percy
     driver.manage
   end
 
+  # Shallow-merge of global (@cli_config.snapshot.readiness) and per-snapshot
+  # (options[:readiness] / options['readiness']) readiness config. Per-snapshot
+  # keys win, unspecified global keys (notably preset: disabled) are inherited.
+  def self.resolve_readiness_config(options)
+    global = @cli_config&.dig('snapshot', 'readiness')
+    global = {} unless global.is_a?(Hash)
+    per_snapshot = options[:readiness] || options['readiness']
+    per_snapshot = {} unless per_snapshot.is_a?(Hash)
+    # Normalise symbol keys to strings so the merge collapses :preset and 'preset'.
+    [global, per_snapshot].each_with_object({}) do |hash, merged|
+      hash.each { |k, v| merged[k.to_s] = v }
+    end
+  end
+
+  # Readiness gate: runs PercyDOM.waitForReady via
+  # execute_async_script BEFORE serialize. Graceful on old CLIs that lack the
+  # method. Returns readiness diagnostics (or nil) for attachment to domSnapshot.
+  def self.wait_for_ready(driver, options)
+    readiness_config = resolve_readiness_config(options)
+    return nil if readiness_config['preset'] == 'disabled'
+
+    # Match the driver's async-script timeout to readiness.timeoutMs so a
+    # higher user-configured timeout isn't silently capped by Selenium's
+    # default (~30s) firing ScriptTimeoutException before the in-page
+    # Promise resolves.
+    timeout_ms = readiness_config['timeoutMs']
+    previous_timeout = nil
+    if timeout_ms.is_a?(Numeric) && timeout_ms > 0
+      begin
+        previous_timeout = driver.manage.timeouts.script_timeout
+        driver.manage.timeouts.script_timeout = (timeout_ms / 1000.0) + 2
+      rescue StandardError
+        previous_timeout = nil # best-effort; older Selenium / unsupported
+      end
+    end
+
+    begin
+      script = <<~JS
+        var cfg = #{readiness_config.to_json};
+        var done = arguments[arguments.length - 1];
+        try {
+          if (typeof PercyDOM !== 'undefined' && typeof PercyDOM.waitForReady === 'function') {
+            PercyDOM.waitForReady(cfg).then(function(r){ done(r); }).catch(function(){ done(); });
+          } else { done(); }
+        } catch (e) { done(); }
+      JS
+      driver.execute_async_script(script)
+    rescue StandardError => e
+      log("waitForReady failed, proceeding to serialize: #{e}", 'debug')
+      nil
+    ensure
+      if previous_timeout
+        begin
+          driver.manage.timeouts.script_timeout = previous_timeout
+        rescue StandardError
+          # best-effort
+        end
+      end
+    end
+  end
+
   def self.get_serialized_dom(driver, options, percy_dom_script: nil)
-    dom_snapshot = driver.execute_script("return PercyDOM.serialize(#{options.to_json})")
+    # Readiness gate before serialize. Graceful on old CLI.
+    readiness_diagnostics = wait_for_ready(driver, options)
+    # Strip `readiness` from forwarded serialize args -- it's consumed by
+    # wait_for_ready upstream, not a PercyDOM.serialize argument.
+    serialize_options = options.reject { |k, _| k.to_s == 'readiness' }
+    dom_snapshot = driver.execute_script("return PercyDOM.serialize(#{serialize_options.to_json})")
+    # `!nil?` preserves legitimate falsy returns like {} ("gate ran, no
+    # notable diagnostics").
+    if !readiness_diagnostics.nil? && dom_snapshot.is_a?(Hash)
+      dom_snapshot['readiness_diagnostics'] = readiness_diagnostics
+    end
     begin
       page_origin = get_origin(driver.current_url)
       iframes = percy_dom_script ? driver.find_elements(:tag_name, 'iframe') : []
