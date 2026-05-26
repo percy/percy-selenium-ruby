@@ -79,10 +79,15 @@ module Percy
     begin
       percy_dom_script = fetch_percy_dom
       driver.execute_script(percy_dom_script)
-      dom_snapshot = if responsive_snapshot_capture?(options)
-        capture_responsive_dom(driver, options, percy_dom_script: percy_dom_script)
+
+      # Merge .percy.yml config options with snapshot options (snapshot options take priority)
+      config_options = @cli_config&.dig('snapshot') || {}
+      merged_options = config_options.merge(options)
+
+      dom_snapshot = if responsive_snapshot_capture?(merged_options)
+        capture_responsive_dom(driver, merged_options, percy_dom_script: percy_dom_script)
       else
-        get_serialized_dom(driver, options, percy_dom_script: percy_dom_script)
+        get_serialized_dom(driver, merged_options, percy_dom_script: percy_dom_script)
       end
 
       # Strip `readiness` before POSTing -- SDK-local config that the CLI
