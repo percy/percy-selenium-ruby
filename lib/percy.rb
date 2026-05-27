@@ -1,11 +1,31 @@
 require 'uri'
 require 'json'
+require 'set'
 require 'version'
 require 'net/http'
 require 'selenium-webdriver'
 require_relative 'driver_metadata'
 
 module Percy
+  # Maximum nesting depth for cross-origin iframe recursion. Bounds the cost
+  # of pathological pages and prevents runaway recursion on cyclic frame trees.
+  DEFAULT_MAX_FRAME_DEPTH = 5
+
+  # Iframe src prefixes / sentinels we never attempt to switch into -- these
+  # represent either browser-internal documents, non-HTTP URI schemes, or
+  # placeholder values that have no meaningful CORS content to capture.
+  UNSUPPORTED_IFRAME_SRCS = %w[
+    about:blank about:srcdoc javascript: data: vbscript: blob: chrome: chrome-extension:
+  ].freeze
+
+  # Raised when a nested-frame restoration step fails and we can no longer
+  # trust that subsequent driver.switch_to / find_elements calls will resolve
+  # against the correct frame context. Carries any iframes captured before
+  # the loss so the caller can still preserve partial work.
+  class PercyContextLost < StandardError
+    attr_accessor :partial_capture
+  end
+
   CLIENT_INFO = "percy-selenium-ruby/#{VERSION}".freeze
   ENV_INFO = "selenium/#{Selenium::WebDriver::VERSION} ruby/#{RUBY_VERSION}".freeze
 
@@ -79,6 +99,9 @@ module Percy
     begin
       percy_dom_script = fetch_percy_dom
       driver.execute_script(percy_dom_script)
+      # Expose closed shadow roots via CDP before serialization so PercyDOM
+      # can pierce them. No-op for non-Chromium drivers / when CDP fails.
+      expose_closed_shadow_roots(driver)
       dom_snapshot = if responsive_snapshot_capture?(options)
         capture_responsive_dom(driver, options, percy_dom_script: percy_dom_script)
       else
@@ -105,6 +128,88 @@ module Percy
     rescue StandardError => e
       log("Could not take DOM snapshot '#{name}'")
       log(e, 'debug')
+    end
+  end
+
+  # Use CDP to discover closed shadow roots and expose them to
+  # PercyDOM.serialize(). Closed shadow roots are inaccessible from JavaScript
+  # (element.shadowRoot is null), but CDP's DOM domain can pierce them. For
+  # each closed shadow root we resolve both the host and the shadow root to JS
+  # objects, then store the shadow in a host-keyed WeakMap that clone-dom.js
+  # reads during serialization. Three CDP calls per closed root:
+  # DOM.getDocument (once, deep+pierce), then resolveNode + resolveNode +
+  # Runtime.callFunctionOn per pair. Non-fatal on any failure -- closed shadow
+  # DOM simply won't be captured (the existing behavior).
+  def self.expose_closed_shadow_roots(driver)
+    return unless driver.respond_to?(:execute_cdp)
+
+    begin
+      result = driver.execute_cdp('DOM.getDocument', depth: -1, pierce: true)
+    rescue StandardError => e
+      log("CDP unavailable for closed shadow root discovery: #{e}", 'debug')
+      return
+    end
+
+    root = result.is_a?(Hash) ? (result['root'] || result[:root]) : nil
+    return unless root
+
+    closed_pairs = []
+    walker = lambda do |node|
+      return if node.nil?
+      # Skip nodes inside child frame documents -- cross-frame closed shadow
+      # roots are not yet supported (their execution context lacks the WeakMap)
+      return if node['contentDocument'] || node[:contentDocument]
+
+      shadow_roots = node['shadowRoots'] || node[:shadowRoots]
+      if shadow_roots.is_a?(Array)
+        shadow_roots.each do |sr|
+          type = sr['shadowRootType'] || sr[:shadowRootType]
+          if type == 'closed'
+            closed_pairs << {
+              host_backend_id: node['backendNodeId'] || node[:backendNodeId],
+              shadow_backend_id: sr['backendNodeId'] || sr[:backendNodeId],
+            }
+          end
+          walker.call(sr)
+        end
+      end
+
+      children = node['children'] || node[:children]
+      children.each(&walker) if children.is_a?(Array)
+    end
+    walker.call(root)
+
+    return if closed_pairs.empty?
+
+    log("Found #{closed_pairs.length} closed shadow root(s), exposing via CDP", 'debug')
+
+    begin
+      driver.execute_script(
+        'window.__percyClosedShadowRoots = window.__percyClosedShadowRoots || new WeakMap();',
+      )
+
+      closed_pairs.each do |pair|
+        host = driver.execute_cdp('DOM.resolveNode', backendNodeId: pair[:host_backend_id])
+        shadow = driver.execute_cdp('DOM.resolveNode', backendNodeId: pair[:shadow_backend_id])
+        host_obj = host.is_a?(Hash) ? (host['object'] || host[:object]) : nil
+        shadow_obj = shadow.is_a?(Hash) ? (shadow['object'] || shadow[:object]) : nil
+        next unless host_obj && shadow_obj
+
+        host_id = host_obj['objectId'] || host_obj[:objectId]
+        shadow_id = shadow_obj['objectId'] || shadow_obj[:objectId]
+        next unless host_id && shadow_id
+
+        driver.execute_cdp(
+          'Runtime.callFunctionOn',
+          functionDeclaration:
+            'function(shadowRoot) { window.__percyClosedShadowRoots.set(this, shadowRoot); }',
+          objectId: host_id,
+          arguments: [{objectId: shadow_id}],
+        )
+      end
+    rescue StandardError => e
+      # Non-fatal -- closed shadow DOM just won't be captured
+      log("Could not expose closed shadow roots via CDP: #{e}", 'debug')
     end
   end
 
@@ -189,45 +294,261 @@ module Percy
     if !readiness_diagnostics.nil? && dom_snapshot.is_a?(Hash)
       dom_snapshot['readiness_diagnostics'] = readiness_diagnostics
     end
-    begin
-      page_origin = get_origin(driver.current_url)
-      iframes = percy_dom_script ? driver.find_elements(:tag_name, 'iframe') : []
-      if iframes.any?
-        processed_frames = []
-        iframes.each do |frame|
-          frame_src = frame.attribute('src')
-          next if unsupported_iframe_src?(frame_src)
-
-          begin
-            frame_origin = get_origin(URI.join(driver.current_url, frame_src).to_s)
-          rescue StandardError => e
-            log("Skipping iframe \"#{frame_src}\": #{e}", 'debug')
-            next
-          end
-
-          next if frame_origin == page_origin
-
-          result = process_frame(driver, frame, options, percy_dom_script)
-          processed_frames << result if result
-        end
-        dom_snapshot['corsIframes'] = processed_frames if processed_frames.any?
-      end
-    rescue StandardError => e
-      log("Failed to process cross-origin iframes: #{e}", 'debug')
-      begin
-        driver.switch_to.default_content
-      rescue StandardError
-        nil
-      end
+    if percy_dom_script
+      max_depth = resolve_max_frame_depth(options, @cli_config)
+      ignore_selectors = resolve_ignore_selectors(options, @cli_config)
+      ctx = {
+        max_frame_depth: max_depth,
+        ignore_selectors: ignore_selectors,
+        serialize_options: options,
+        percy_dom_script: percy_dom_script,
+      }
+      processed = capture_cors_iframes(driver, ctx)
+      dom_snapshot['corsIframes'] = processed if processed.any?
     end
 
     dom_snapshot['cookies'] = get_browser_instance(driver).all_cookies
     dom_snapshot
   end
 
+  # Top-level entry: enumerate iframes from the page document, filter the
+  # ones we should never enter (browser-internal, srcdoc, same-origin,
+  # ignored), then recurse into each one through process_frame_tree. A
+  # PercyContextLost raised by a deeper frame aborts further sibling
+  # iteration but preserves whatever we already captured.
+  def self.capture_cors_iframes(driver, ctx)
+    page_url = driver.current_url
+    page_origin = begin
+                    get_origin(page_url)
+                  rescue StandardError
+                    nil
+                  end
+    iframes_meta = enumerate_iframes(driver, ctx[:ignore_selectors])
+    return [] if iframes_meta.empty?
+
+    cors = []
+    iframes_meta.each do |meta|
+      next if should_skip_iframe?(meta, page_origin)
+
+      element = find_iframe_by_percy_id(driver, meta['percyElementId'])
+      next if element.nil?
+
+      begin
+        entries = process_frame_tree(driver, element, meta, 1,
+          Set.new([page_url].compact), ctx,)
+        cors.concat(entries) if entries.any?
+      rescue PercyContextLost => e
+        log('Aborting further nested CORS capture due to lost frame context', 'debug')
+        cors.concat(e.partial_capture) if e.partial_capture&.any?
+        break
+      end
+    end
+
+    cors
+  rescue StandardError => e
+    log("Failed to process cross-origin iframes: #{e}", 'debug')
+    begin
+      driver.switch_to.default_content
+    rescue StandardError
+      nil
+    end
+    []
+  end
+
+  def self.enumerate_iframes(driver, ignore_selectors)
+    result = driver.execute_script("return #{enumerate_iframes_script(ignore_selectors)}")
+    result.is_a?(Array) ? result : []
+  rescue StandardError => e
+    log("Failed to enumerate iframes: #{e}", 'debug')
+    []
+  end
+
+  # Look up an <iframe> WebElement by its percyElementId (set by PercyDOM.serialize
+  # on the parent document). Using a stable identifier instead of positional
+  # alignment against driver.find_elements(:tag_name, 'iframe') eliminates a
+  # race window where a DOM mutation between the JS enumerate_iframes call and
+  # the Selenium find_elements call would silently shuffle meta -> element
+  # mappings and ship one iframe's content under another's percyElementId.
+  def self.find_iframe_by_percy_id(driver, percy_element_id)
+    return nil if percy_element_id.nil? || percy_element_id.to_s.empty?
+
+    # CSS attribute selectors don't accept arbitrary unescaped quotes; the
+    # percyElementId is a UUID-like value emitted by PercyDOM, so a simple
+    # equality match is sufficient in practice. We still CSS-escape backslashes
+    # and double-quotes defensively so a non-UUID id can't break the selector
+    # or open an injection vector. Anything beyond that which still trips the
+    # parser falls through to the rescue below and returns nil.
+    # Single-pass escape so backslash and quote escaping can't tangle: each
+    # match is replaced with itself prefixed by a backslash.
+    escaped = percy_element_id.to_s.gsub(/[\\"]/) { |c| "\\#{c}" }
+    driver.find_element(css: %(iframe[data-percy-element-id="#{escaped}"]))
+  rescue StandardError => e
+    log("Could not locate iframe by percyElementId #{percy_element_id}: #{e}", 'debug')
+    nil
+  end
+
+  def self.should_skip_iframe?(meta, parent_origin)
+    src = meta['src']
+    # data-percy-ignore lets page authors opt a single iframe out of capture
+    # without needing a project-wide selector configuration.
+    if meta['dataPercyIgnore']
+      log("Skipping iframe marked with data-percy-ignore: #{src || '(no src)'}", 'debug')
+      return true
+    end
+    # ignoreIframeSelectors is project- or call-level config -- selector match
+    # is computed in-browser by enumerate_iframes_script against the page's
+    # current DOM, so we just trust the flag here.
+    if meta['matchesIgnoreSelector']
+      log("Skipping iframe matching ignoreIframeSelectors: #{src || '(no src)'}", 'debug')
+      return true
+    end
+    return true if is_unsupported_iframe_src?(src)
+    return true if meta['srcdoc'] && !meta['srcdoc'].to_s.empty?
+    return true if meta['percyElementId'].nil? || meta['percyElementId'].to_s.empty?
+
+    frame_origin = begin
+                     get_origin(src)
+                   rescue StandardError
+                     nil
+                   end
+    return true if frame_origin.nil?
+    return true if frame_origin == parent_origin
+
+    false
+  end
+
+  # Switch into iframe_element, serialize its document, then recurse into
+  # nested cross-origin iframes that live inside it. Depth-capped against
+  # ctx[:max_frame_depth] and guarded against cyclic frame trees by
+  # ancestor_urls. Restores the parent frame on exit; if that restoration
+  # fails inside a nested call, raises PercyContextLost carrying the partial
+  # capture so the caller can preserve work done before the loss.
+  def self.process_frame_tree(driver, iframe_element, meta, depth, ancestor_urls, ctx)
+    if depth > ctx[:max_frame_depth]
+      log("Reached max iframe nesting depth (#{ctx[:max_frame_depth]}); " \
+          "stopping at #{meta['src']}", 'debug',)
+      return []
+    end
+    if ancestor_urls.include?(meta['src'])
+      log("Skipping cyclic iframe (#{meta['src']} appears in ancestor chain)", 'debug')
+      return []
+    end
+
+    collected = []
+    switched_in = false
+
+    begin
+      driver.switch_to.frame(iframe_element)
+      switched_in = true
+
+      driver.execute_script(ctx[:percy_dom_script])
+
+      # Post-switch URL re-check: failed cross-origin navigations land on
+      # about:blank or chrome-error://... in the iframe's *document* context.
+      # The pre-switch shouldSkipIframe filter on meta['src'] can't see this --
+      # the attribute still holds the original https:// URL. Drop these so we
+      # don't ship browser error pages as "captured" content.
+      frame_url = begin
+                    driver.execute_script('return document.URL')
+                  rescue StandardError
+                    meta['src']
+                  end
+      if is_unsupported_iframe_src?(frame_url)
+        log("Skipping iframe whose document loaded an unsupported URL: #{frame_url}", 'debug')
+        return collected
+      end
+
+      iframe_options = (ctx[:serialize_options] || {}).merge('enableJavaScript' => true)
+      iframe_snapshot =
+        driver.execute_script("return PercyDOM.serialize(#{iframe_options.to_json})")
+
+      if iframe_snapshot.nil?
+        log("Serialization returned empty result for frame: #{meta['src']}", 'debug')
+        return collected
+      end
+
+      collected << {
+        'iframeData' => {'percyElementId' => meta['percyElementId']},
+        'iframeSnapshot' => iframe_snapshot,
+        'frameUrl' => frame_url || meta['src'],
+      }
+      log("Captured cross-origin iframe (depth #{depth}): #{frame_url || meta['src']}", 'debug')
+
+      if depth < ctx[:max_frame_depth]
+        current_origin = begin
+                           get_origin(frame_url || meta['src'])
+                         rescue StandardError
+                           nil
+                         end
+        child_metas = enumerate_iframes(driver, ctx[:ignore_selectors])
+        next_ancestors = ancestor_urls.dup
+        next_ancestors.add(meta['src'])
+        next_ancestors.add(frame_url) if frame_url
+        child_metas.each do |child_meta|
+          next if should_skip_iframe?(child_meta, current_origin)
+
+          child_element = find_iframe_by_percy_id(driver, child_meta['percyElementId'])
+          next if child_element.nil?
+
+          nested = process_frame_tree(driver, child_element, child_meta, depth + 1,
+            next_ancestors, ctx,)
+          collected.concat(nested) if nested.any?
+        end
+      end
+
+      collected
+    rescue PercyContextLost => e
+      # Merge any partial capture from the inner level into ours before propagating
+      if e.partial_capture&.any?
+        collected.concat(e.partial_capture)
+      end
+      e.partial_capture = collected
+      raise
+    rescue StandardError => e
+      log("Failed to process cross-origin iframe #{meta['src']}: #{e}", 'debug')
+      collected
+    ensure
+      if switched_in
+        # Step up exactly one level so an outer recursion continues from its
+        # own context. If parent_frame fails we have no reliable way to land
+        # in the correct parent -- fall back to default_content and, if this
+        # happened inside a nested frame, raise PercyContextLost so the
+        # caller stops iterating siblings whose enumeration was performed in
+        # a now-lost context.
+        begin
+          driver.switch_to.parent_frame
+        rescue StandardError => e
+          log("Failed to switch back to parent frame: #{e}", 'debug')
+          begin
+            driver.switch_to.default_content
+          rescue StandardError
+            nil
+          end
+          if depth > 1
+            err = PercyContextLost.new("Lost parent frame context: #{e.message}")
+            err.partial_capture = collected
+            raise err
+          end
+        end
+      end
+    end
+  end
+
+  # Inlined helper: returns true for srcs we should never attempt to switch
+  # into (browser-internal, non-HTTP schemes, or placeholders). Also used
+  # post-switch on document.URL to catch about:blank / error-page redirects
+  # that aren't visible in the static src attribute.
+  # rubocop:disable Naming/PredicateName
+  def self.is_unsupported_iframe_src?(src)
+    return true if src.nil? || src.to_s.empty?
+
+    UNSUPPORTED_IFRAME_SRCS.any? { |prefix| src == prefix || src.start_with?(prefix) }
+  end
+  # rubocop:enable Naming/PredicateName
+
+  # Backwards-compatible alias for the original method name.
   def self.unsupported_iframe_src?(src)
-    src.nil? || src.empty? || src == 'about:blank' ||
-      src.start_with?('javascript:') || src.start_with?('data:') || src.start_with?('vbscript:')
+    is_unsupported_iframe_src?(src)
   end
 
   def self.get_origin(url)
@@ -240,53 +561,77 @@ module Percy
     "#{uri.scheme}://#{netloc}"
   end
 
-  def self.process_frame(driver, frame_element, options, percy_dom_script)
-    frame_url = frame_element.attribute('src') || 'unknown-src'
-    iframe_snapshot = nil
+  # Clamp a user-supplied iframe depth to a sane range. Negative or non-numeric
+  # input falls back to the default; very large values are capped to avoid
+  # unbounded recursion on degenerate pages.
+  def self.clamp_frame_depth(depth, default: DEFAULT_MAX_FRAME_DEPTH)
+    return default if depth.nil?
 
-    begin
-      driver.switch_to.frame(frame_element)
-      begin
-        driver.execute_script(percy_dom_script)
-        iframe_options = options.merge('enableJavaScript' => true)
-        iframe_snapshot =
-          driver.execute_script("return PercyDOM.serialize(#{iframe_options.to_json})")
-      rescue StandardError => e
-        log("Failed to process cross-origin frame #{frame_url}: #{e}", 'debug')
-      ensure
-        begin
-          driver.switch_to.default_content
+    n = begin
+          Integer(depth)
         rescue StandardError
-          begin
-            driver.switch_to.parent_frame
-          rescue StandardError
-            nil
-          end
+          nil
         end
-      end
-    rescue StandardError => e
-      log("Failed to switch to frame #{frame_url}: #{e}", 'debug')
-      begin
-        driver.switch_to.default_content
-      rescue StandardError
-        nil
-      end
-      return nil
-    end
+    return default if n.nil?
+    return 0 if n < 0
 
-    return nil if iframe_snapshot.nil?
+    [n, 50].min
+  end
 
-    percy_element_id = frame_element.attribute('data-percy-element-id')
-    unless percy_element_id
-      log("Skipping frame #{frame_url}: no matching percyElementId found", 'debug')
-      return nil
-    end
+  # Accept selector input as String, Array, or nil and produce a flat array of
+  # non-empty strings. Lets the user pass either a single selector or many.
+  def self.normalize_ignore_selectors(input)
+    return [] if input.nil?
 
-    {
-      'iframeData' => {'percyElementId' => percy_element_id},
-      'iframeSnapshot' => iframe_snapshot,
-      'frameUrl' => frame_url,
-    }
+    arr = input.is_a?(Array) ? input : [input]
+    arr.flat_map { |s| s.is_a?(Array) ? s : [s] }
+      .reject { |s| s.nil? || s.to_s.strip.empty? }
+      .map(&:to_s)
+  end
+
+  def self.resolve_max_frame_depth(options, config = nil)
+    val = options[:maxIframeDepth] || options[:max_iframe_depth] ||
+      config&.dig('snapshot', 'maxIframeDepth')
+    clamp_frame_depth(val)
+  end
+
+  def self.resolve_ignore_selectors(options, config = nil)
+    val = options[:ignoreIframeSelectors] || options[:ignore_iframe_selectors] ||
+      config&.dig('snapshot', 'ignoreIframeSelectors') || []
+    normalize_ignore_selectors(val)
+  end
+
+  # Browser-side script that enumerates all <iframe> elements and returns a
+  # plain-data array describing each, including data-percy-ignore attribute
+  # state and which configured ignoreIframeSelectors it matches. We do all
+  # filtering off this snapshot rather than re-querying the DOM repeatedly.
+  def self.enumerate_iframes_script(selectors)
+    selectors_json = (selectors || []).to_json
+    <<~JS
+      (function() {
+        var selectors = #{selectors_json};
+        var iframes = document.querySelectorAll('iframe');
+        var result = [];
+        for (var i = 0; i < iframes.length; i++) {
+          var frame = iframes[i];
+          var matchesIgnore = false;
+          if (selectors && selectors.length) {
+            for (var j = 0; j < selectors.length; j++) {
+              try { if (frame.matches(selectors[j])) { matchesIgnore = true; break; } } catch (e) {}
+            }
+          }
+          result.push({
+            src: frame.src || '',
+            srcdoc: frame.getAttribute('srcdoc'),
+            percyElementId: frame.getAttribute('data-percy-element-id'),
+            dataPercyIgnore: frame.hasAttribute('data-percy-ignore'),
+            matchesIgnoreSelector: matchesIgnore,
+            index: i
+          });
+        }
+        return result;
+      })();
+    JS
   end
 
   def self.get_responsive_widths(widths = [])
@@ -384,6 +729,9 @@ module Percy
           end
           percy_dom_script = fetch_percy_dom
           driver.execute_script(percy_dom_script)
+          # Re-prime the closed-shadow-root WeakMap -- page.refresh creates a
+          # new document and erases window.__percyClosedShadowRoots.
+          expose_closed_shadow_roots(driver)
           driver.execute_script('PercyDOM.waitForResize()')
           resize_count = 0
         end

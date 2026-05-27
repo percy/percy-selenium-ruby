@@ -459,6 +459,62 @@ RSpec.describe Percy do
     it 'returns false for a relative url' do
       expect(Percy.unsupported_iframe_src?('/embed.html')).to be false
     end
+
+    it 'returns false for a src whose first segment is the literal "blank"' do
+      # Regression: the previous UNSUPPORTED_IFRAME_SRCS list contained the bare
+      # token "blank", which matched any src starting with "blank" (e.g.
+      # blanket.com/...). The about:blank case stays covered by the explicit
+      # about:blank entry.
+      expect(Percy.unsupported_iframe_src?('https://blanket.com/page')).to be false
+      expect(Percy.unsupported_iframe_src?('blank-canvas://x')).to be false
+    end
+  end
+
+  describe '.find_iframe_by_percy_id' do
+    let(:driver) { instance_double('Selenium::WebDriver::Driver') }
+
+    it 'returns nil when percyElementId is nil or empty' do
+      expect(Percy.find_iframe_by_percy_id(driver, nil)).to be_nil
+      expect(Percy.find_iframe_by_percy_id(driver, '')).to be_nil
+    end
+
+    it 'queries the driver via the data-percy-element-id attribute selector' do
+      element = instance_double('Selenium::WebDriver::Element')
+      expect(driver).to receive(:find_element)
+        .with(css: 'iframe[data-percy-element-id="abc-123"]')
+        .and_return(element)
+      expect(Percy.find_iframe_by_percy_id(driver, 'abc-123')).to eq(element)
+    end
+
+    it 'returns nil when the lookup raises (no matching element)' do
+      allow(driver).to receive(:find_element)
+        .and_raise(Selenium::WebDriver::Error::NoSuchElementError.new('no match'))
+      expect(Percy.find_iframe_by_percy_id(driver, 'missing-id')).to be_nil
+    end
+
+    it 'CSS-escapes embedded double-quotes and backslashes in percyElementId' do
+      # Defensive hardening: if a percyElementId ever leaks an unescaped quote
+      # or backslash, the selector should be escaped rather than broken (or
+      # injectable). If the underlying driver still can't resolve it, the
+      # rescue path returns nil cleanly without raising.
+      element = instance_double('Selenium::WebDriver::Element')
+      expect(driver).to receive(:find_element)
+        .with(css: 'iframe[data-percy-element-id="abc\\\\def\\"ghi"]')
+        .and_return(element)
+
+      expect {
+        result = Percy.find_iframe_by_percy_id(driver, 'abc\\def"ghi')
+        expect(result).to eq(element)
+      }.to_not raise_error
+    end
+
+    it 'returns nil cleanly when an escaped lookup still fails' do
+      allow(driver).to receive(:find_element)
+        .and_raise(Selenium::WebDriver::Error::NoSuchElementError.new('no match'))
+      expect {
+        expect(Percy.find_iframe_by_percy_id(driver, 'weird"id\\value')).to be_nil
+      }.to_not raise_error
+    end
   end
 
   describe '.get_origin' do
@@ -495,97 +551,303 @@ RSpec.describe Percy do
     end
   end
 
-  describe '.process_frame' do
+  describe '.expose_closed_shadow_roots' do
+    let(:driver) { double('driver') }
+
+    before(:each) do
+      allow(Percy).to receive(:log)
+    end
+
+    it 'no-ops when driver does not respond to execute_cdp' do
+      allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(false)
+      expect(driver).to_not receive(:execute_cdp)
+      Percy.expose_closed_shadow_roots(driver)
+    end
+
+    it 'returns silently when DOM.getDocument fails' do
+      allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(true)
+      allow(driver).to receive(:execute_cdp).with('DOM.getDocument', anything)
+        .and_raise(StandardError, 'CDP not available')
+      expect { Percy.expose_closed_shadow_roots(driver) }.to_not raise_error
+    end
+
+    it 'is a no-op when no closed shadow roots are present' do
+      allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(true)
+      allow(driver).to receive(:execute_cdp).with('DOM.getDocument', anything)
+        .and_return({'root' => {'children' => []}})
+      expect(driver).to_not receive(:execute_script)
+      Percy.expose_closed_shadow_roots(driver)
+    end
+
+    it 'walks the tree, resolves both nodes, and registers via Runtime.callFunctionOn' do
+      tree = {
+        'root' => {
+          'backendNodeId' => 1,
+          'children' => [{
+            'backendNodeId' => 2,
+            'shadowRoots' => [{
+              'backendNodeId' => 3,
+              'shadowRootType' => 'closed',
+            }],
+          }],
+        },
+      }
+      allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(true)
+      allow(driver).to receive(:execute_cdp).with('DOM.getDocument', anything).and_return(tree)
+      allow(driver).to receive(:execute_cdp).with('DOM.resolveNode', backendNodeId: 2)
+        .and_return({'object' => {'objectId' => 'host-obj'}})
+      allow(driver).to receive(:execute_cdp).with('DOM.resolveNode', backendNodeId: 3)
+        .and_return({'object' => {'objectId' => 'shadow-obj'}})
+      expect(driver).to receive(:execute_script)
+        .with(/__percyClosedShadowRoots/)
+      expect(driver).to receive(:execute_cdp).with(
+        'Runtime.callFunctionOn',
+        hash_including(objectId: 'host-obj'),
+      )
+      Percy.expose_closed_shadow_roots(driver)
+    end
+
+    it 'skips contentDocument subtrees (cross-frame closed roots not supported)' do
+      tree = {
+        'root' => {
+          'children' => [{
+            'backendNodeId' => 10,
+            'contentDocument' => {
+              'shadowRoots' => [{
+                'backendNodeId' => 11,
+                'shadowRootType' => 'closed',
+              }],
+            },
+          }],
+        },
+      }
+      allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(true)
+      allow(driver).to receive(:execute_cdp).with('DOM.getDocument', anything).and_return(tree)
+      expect(driver).to_not receive(:execute_script)
+      Percy.expose_closed_shadow_roots(driver)
+    end
+  end
+
+  describe '.process_frame_tree' do
     let(:driver)        { double('driver') }
     let(:frame_element) { double('frame_element') }
     let(:switch_to)     { double('switch_to') }
+    let(:ctx) do
+      {
+        max_frame_depth: Percy::DEFAULT_MAX_FRAME_DEPTH,
+        ignore_selectors: [],
+        serialize_options: {},
+        percy_dom_script: 'percy_dom_script',
+      }
+    end
 
     before(:each) do
       allow(driver).to receive(:switch_to).and_return(switch_to)
       allow(switch_to).to receive(:frame)
       allow(switch_to).to receive(:parent_frame)
       allow(switch_to).to receive(:default_content)
+      allow(Percy).to receive(:log)
+    end
+
+    def meta_for(src:, percy_id: 'elem-123', ignore: false, matches_ignore: false, srcdoc: nil)
+      {
+        'src' => src,
+        'srcdoc' => srcdoc,
+        'percyElementId' => percy_id,
+        'dataPercyIgnore' => ignore,
+        'matchesIgnoreSelector' => matches_ignore,
+        'index' => 0,
+      }
     end
 
     it 'returns a hash with iframeData, iframeSnapshot, and frameUrl on success' do
-      allow(frame_element).to receive(:attribute).with('src')
-        .and_return('https://other.example.com/page')
-      allow(frame_element).to receive(:attribute).with('data-percy-element-id')
-        .and_return('elem-123')
-      allow(driver).to receive(:execute_script).and_return(nil, {'html' => '<html/>'})
+      meta = meta_for(src: 'https://other.example.com/page', percy_id: 'elem-123')
+      allow(driver).to receive(:execute_script) do |script|
+        if script.include?('document.URL')
+          'https://other.example.com/page'
+        elsif script.include?('PercyDOM.serialize')
+          {'html' => '<html/>'}
+        elsif script.include?('querySelectorAll')
+          []
+        end
+      end
+      allow(driver).to receive(:find_elements).with(css: 'iframe').and_return([])
 
-      result = Percy.process_frame(driver, frame_element, {}, 'percy_dom_script')
+      result = Percy.process_frame_tree(driver, frame_element, meta, 1, Set.new, ctx)
 
-      expect(result).to_not be_nil
-      expect(result['iframeData']['percyElementId']).to eq('elem-123')
-      expect(result['iframeSnapshot']).to eq({'html' => '<html/>'})
-      expect(result['frameUrl']).to eq('https://other.example.com/page')
+      expect(result.length).to eq(1)
+      expect(result[0]['iframeData']['percyElementId']).to eq('elem-123')
+      expect(result[0]['iframeSnapshot']).to eq({'html' => '<html/>'})
+      expect(result[0]['frameUrl']).to eq('https://other.example.com/page')
     end
 
-    it 'returns nil when data-percy-element-id attribute is missing' do
-      allow(frame_element).to receive(:attribute).with('src').and_return('https://other.example.com/page')
-      allow(frame_element).to receive(:attribute).with('data-percy-element-id').and_return(nil)
-      allow(driver).to receive(:execute_script).and_return(nil, {'html' => '<html/>'})
-
-      result = Percy.process_frame(driver, frame_element, {}, 'percy_dom_script')
-      expect(result).to be_nil
-    end
-
-    it 'returns nil when execute_script raises inside the iframe' do
-      allow(frame_element).to receive(:attribute).with('src').and_return('https://other.example.com/page')
+    it 'returns empty array when execute_script raises inside the iframe' do
+      meta = meta_for(src: 'https://other.example.com/page')
       allow(driver).to receive(:execute_script).and_raise(StandardError, 'injection error')
 
-      result = Percy.process_frame(driver, frame_element, {}, 'percy_dom_script')
-      expect(result).to be_nil
+      result = Percy.process_frame_tree(driver, frame_element, meta, 1, Set.new, ctx)
+      expect(result).to eq([])
     end
 
-    it 'returns nil when switching to the frame fails' do
-      allow(frame_element).to receive(:attribute).with('src').and_return('https://other.example.com/page')
+    it 'returns empty array when switching to the frame fails' do
+      meta = meta_for(src: 'https://other.example.com/page')
       allow(switch_to).to receive(:frame).and_raise(StandardError, 'no such frame')
 
-      result = Percy.process_frame(driver, frame_element, {}, 'percy_dom_script')
-      expect(result).to be_nil
-    end
-
-    it 'uses unknown-src fallback when frame has no src attribute' do
-      allow(frame_element).to receive(:attribute).with('src').and_return(nil)
-      allow(frame_element).to receive(:attribute).with('data-percy-element-id')
-        .and_return('elem-nosrc')
-      allow(driver).to receive(:execute_script).and_return(nil, {'html' => '<html/>'})
-
-      result = Percy.process_frame(driver, frame_element, {}, 'percy_dom_script')
-      expect(result['frameUrl']).to eq('unknown-src')
+      result = Percy.process_frame_tree(driver, frame_element, meta, 1, Set.new, ctx)
+      expect(result).to eq([])
     end
 
     it 'merges enableJavaScript into the PercyDOM.serialize call' do
-      allow(frame_element).to receive(:attribute).with('src')
-        .and_return('https://other.example.com/page')
-      allow(frame_element).to receive(:attribute).with('data-percy-element-id')
-        .and_return('elem-abc')
-
+      meta = meta_for(src: 'https://other.example.com/page', percy_id: 'elem-abc')
       captured_serialize_call = nil
-      call_count = 0
       allow(driver).to receive(:execute_script) do |script|
-        call_count += 1
-        if call_count == 2
+        if script.include?('document.URL')
+          'https://other.example.com/page'
+        elsif script.include?('PercyDOM.serialize')
           captured_serialize_call = script
           {'html' => '<html/>'}
+        elsif script.include?('querySelectorAll')
+          []
         end
       end
+      allow(driver).to receive(:find_elements).with(css: 'iframe').and_return([])
 
-      Percy.process_frame(driver, frame_element, {someOpt: 1}, 'percy_dom_script')
+      custom_ctx = ctx.merge(serialize_options: {someOpt: 1})
+      Percy.process_frame_tree(driver, frame_element, meta, 1, Set.new, custom_ctx)
 
       expect(captured_serialize_call).to include('enableJavaScript')
       expect(captured_serialize_call).to include('true')
     end
 
-    it 'always switches back to default content even when script injection fails' do
-      allow(frame_element).to receive(:attribute).with('src')
-        .and_return('https://other.example.com/page')
-      expect(switch_to).to receive(:default_content).once
+    it 'always returns to the parent frame even when script injection fails' do
+      meta = meta_for(src: 'https://other.example.com/page')
+      expect(switch_to).to receive(:parent_frame).once
       allow(driver).to receive(:execute_script).and_raise(StandardError, 'error')
 
-      Percy.process_frame(driver, frame_element, {}, 'percy_dom_script')
+      Percy.process_frame_tree(driver, frame_element, meta, 1, Set.new, ctx)
+    end
+
+    it 'stops descending once max_frame_depth is exceeded' do
+      meta = meta_for(src: 'https://other.example.com/page')
+      shallow_ctx = ctx.merge(max_frame_depth: 1)
+
+      result = Percy.process_frame_tree(driver, frame_element, meta, 2, Set.new, shallow_ctx)
+      expect(result).to eq([])
+    end
+
+    it 'skips cyclic iframes that appear in the ancestor chain' do
+      meta = meta_for(src: 'https://other.example.com/page')
+      ancestors = Set.new(['https://other.example.com/page'])
+
+      result = Percy.process_frame_tree(driver, frame_element, meta, 1, ancestors, ctx)
+      expect(result).to eq([])
+    end
+
+    it 'skips frames whose document.URL post-switch is about:blank' do
+      meta = meta_for(src: 'https://other.example.com/error-page', percy_id: 'elem-err')
+      allow(driver).to receive(:execute_script) do |script|
+        if script.include?('document.URL')
+          'about:blank' # cross-origin nav failed, landed on blank
+        elsif script.include?('PercyDOM.serialize')
+          {'html' => '<should-not-capture/>'}
+        elsif script.include?('querySelectorAll')
+          []
+        end
+      end
+      allow(driver).to receive(:find_elements).with(css: 'iframe').and_return([])
+
+      result = Percy.process_frame_tree(driver, frame_element, meta, 1, Set.new, ctx)
+      expect(result).to eq([])
+    end
+
+    it 'resolves nested child iframes by percyElementId (not by index)' do
+      # Regression: the child-level lookup must use find_element with the
+      # data-percy-element-id selector, matching the same stable-id contract
+      # used at the top level. A positional alignment against
+      # find_elements(:tag_name, 'iframe') would silently mis-pair meta to
+      # element if the DOM mutated between enumerate_iframes and find_elements.
+      meta = meta_for(src: 'https://other.example.com/parent', percy_id: 'parent-id')
+      child_meta = {
+        'src' => 'https://third.example.com/child',
+        'srcdoc' => nil,
+        'percyElementId' => 'child-pid',
+        'dataPercyIgnore' => false,
+        'matchesIgnoreSelector' => false,
+        'index' => 0,
+      }
+
+      allow(driver).to receive(:execute_script) do |script|
+        if script.include?('document.URL')
+          'https://other.example.com/parent'
+        elsif script.include?('PercyDOM.serialize')
+          {'html' => '<parent/>'}
+        elsif script.include?('querySelectorAll') || script.include?('iframe')
+          [child_meta]
+        end
+      end
+
+      child_element = double('child_element')
+      expect(driver).to_not receive(:find_elements)
+      expect(driver).to receive(:find_element)
+        .with(css: 'iframe[data-percy-element-id="child-pid"]')
+        .and_return(child_element)
+
+      # Short-circuit the recursive descent into the child so we only verify
+      # the child-level lookup path.
+      original = Percy.method(:process_frame_tree)
+      allow(Percy).to receive(:process_frame_tree).and_wrap_original do |_m, *args|
+        if args[1] == child_element
+          []
+        else
+          original.call(*args)
+        end
+      end
+
+      Percy.process_frame_tree(driver, frame_element, meta, 1, Set.new, ctx)
+    end
+
+    it 'raises PercyContextLost when parent_frame fails inside a nested frame' do
+      meta = meta_for(src: 'https://other.example.com/page', percy_id: 'elem-deep')
+      allow(driver).to receive(:execute_script) do |script|
+        if script.include?('document.URL')
+          'https://other.example.com/page'
+        elsif script.include?('PercyDOM.serialize')
+          {'html' => '<deep/>'}
+        elsif script.include?('querySelectorAll')
+          []
+        end
+      end
+      allow(driver).to receive(:find_elements).with(css: 'iframe').and_return([])
+      allow(switch_to).to receive(:parent_frame).and_raise(StandardError, 'lost context')
+
+      expect {
+        Percy.process_frame_tree(driver, frame_element, meta, 2, Set.new, ctx)
+      }.to raise_error(Percy::PercyContextLost) { |err|
+        expect(err.partial_capture.length).to eq(1)
+      }
+    end
+  end
+
+  describe 'Percy::PercyContextLost' do
+    # Regression: previous code paths could overwrite the original backtrace
+    # by re-raising a new error. The exception's backtrace must point at the
+    # raise site, not nil and not at the rescue site.
+    it 'preserves the original backtrace when raised then rescued' do
+      raised_line = nil
+      err = nil
+      begin
+        raised_line = __LINE__ + 1
+        raise Percy::PercyContextLost, 'simulated context loss'
+      rescue Percy::PercyContextLost => e
+        err = e
+      end
+
+      expect(err).to be_a(Percy::PercyContextLost)
+      expect(err.backtrace).to_not be_nil
+      expect(err.backtrace).to_not be_empty
+      # The top frame of the backtrace should point at the raise line in this file
+      expect(err.backtrace.first).to include(__FILE__)
+      expect(err.backtrace.first).to include(":#{raised_line}:")
     end
   end
 
@@ -594,6 +856,17 @@ RSpec.describe Percy do
     let(:manage)    { double('manage') }
     let(:switch_to) { double('switch_to') }
 
+    def iframe_meta(src:, percy_id: 'cid-1', ignore: false, matches_ignore: false, srcdoc: nil)
+      {
+        'src' => src,
+        'srcdoc' => srcdoc,
+        'percyElementId' => percy_id,
+        'dataPercyIgnore' => ignore,
+        'matchesIgnoreSelector' => matches_ignore,
+        'index' => 0,
+      }
+    end
+
     before(:each) do
       allow(driver).to receive(:manage).and_return(manage)
       allow(manage).to receive(:all_cookies).and_return([])
@@ -601,12 +874,19 @@ RSpec.describe Percy do
       allow(switch_to).to receive(:frame)
       allow(switch_to).to receive(:parent_frame)
       allow(switch_to).to receive(:default_content)
+      allow(Percy).to receive(:log)
     end
 
     it 'returns the serialized dom with cookies when no iframes present' do
-      allow(driver).to receive(:execute_script).and_return({'html' => '<html/>'})
+      allow(driver).to receive(:execute_script) do |script|
+        if script.include?('PercyDOM.serialize')
+          {'html' => '<html/>'}
+        else
+          [] # enumerate_iframes
+        end
+      end
       allow(driver).to receive(:current_url).and_return('http://main.example.com/')
-      allow(driver).to receive(:find_elements).and_return([])
+      allow(driver).to receive(:find_elements).with(css: 'iframe').and_return([])
 
       dom = Percy.get_serialized_dom(driver, {})
       expect(dom['html']).to eq('<html/>')
@@ -616,20 +896,23 @@ RSpec.describe Percy do
 
     it 'populates corsIframes for cross-origin frames' do
       frame = double('frame')
-      allow(frame).to receive(:attribute).with('src').and_return('https://cross.example.com/page')
-      allow(frame).to receive(:attribute).with('data-percy-element-id').and_return('cid-1')
 
-      call_count = 0
-      allow(driver).to receive(:execute_script) do
-        call_count += 1
-        case call_count
-        when 1 then {'html' => '<main/>'}
-        when 2 then nil
-        when 3 then {'html' => '<frame/>'}
+      script_calls = 0
+      allow(driver).to receive(:execute_script) do |script|
+        script_calls += 1
+        if script_calls == 1
+          {'html' => '<main/>'} # top-level serialize
+        elsif script.include?('querySelectorAll')
+          [iframe_meta(src: 'https://cross.example.com/page', percy_id: 'cid-1')]
+        elsif script.include?('document.URL')
+          'https://cross.example.com/page'
+        elsif script.include?('PercyDOM.serialize')
+          {'html' => '<frame/>'}
         end
       end
       allow(driver).to receive(:current_url).and_return('http://main.example.com/')
-      allow(driver).to receive(:find_elements).and_return([frame])
+      allow(driver).to receive(:find_element)
+        .with(css: 'iframe[data-percy-element-id="cid-1"]').and_return(frame)
 
       dom = Percy.get_serialized_dom(driver, {}, percy_dom_script: 'percy_dom_script')
 
@@ -642,10 +925,17 @@ RSpec.describe Percy do
 
     it 'skips same-origin iframes' do
       frame = double('frame')
-      allow(frame).to receive(:attribute).with('src').and_return('http://main.example.com/inner.html')
-      allow(driver).to receive(:execute_script).and_return({'html' => '<html/>'})
+      script_calls = 0
+      allow(driver).to receive(:execute_script) do |script|
+        script_calls += 1
+        if script_calls == 1
+          {'html' => '<html/>'}
+        elsif script.include?('querySelectorAll')
+          [iframe_meta(src: 'http://main.example.com/inner.html')]
+        end
+      end
       allow(driver).to receive(:current_url).and_return('http://main.example.com/')
-      allow(driver).to receive(:find_elements).and_return([frame])
+      allow(driver).to receive(:find_elements).with(css: 'iframe').and_return([frame])
 
       dom = Percy.get_serialized_dom(driver, {}, percy_dom_script: 'percy_dom_script')
       expect(dom).to_not have_key('corsIframes')
@@ -653,10 +943,17 @@ RSpec.describe Percy do
 
     it 'skips iframes with about:blank src' do
       frame = double('frame')
-      allow(frame).to receive(:attribute).with('src').and_return('about:blank')
-      allow(driver).to receive(:execute_script).and_return({'html' => '<html/>'})
+      script_calls = 0
+      allow(driver).to receive(:execute_script) do |script|
+        script_calls += 1
+        if script_calls == 1
+          {'html' => '<html/>'}
+        elsif script.include?('querySelectorAll')
+          [iframe_meta(src: 'about:blank')]
+        end
+      end
       allow(driver).to receive(:current_url).and_return('http://main.example.com/')
-      allow(driver).to receive(:find_elements).and_return([frame])
+      allow(driver).to receive(:find_elements).with(css: 'iframe').and_return([frame])
 
       dom = Percy.get_serialized_dom(driver, {}, percy_dom_script: 'percy_dom_script')
       expect(dom).to_not have_key('corsIframes')
@@ -673,20 +970,22 @@ RSpec.describe Percy do
 
     it 'treats same host with different scheme as cross-origin' do
       frame = double('frame')
-      allow(frame).to receive(:attribute).with('src').and_return('https://main.example.com/widget')
-      allow(frame).to receive(:attribute).with('data-percy-element-id').and_return('percy-id-1')
-
-      call_count = 0
-      allow(driver).to receive(:execute_script) do
-        call_count += 1
-        if call_count == 1
+      script_calls = 0
+      allow(driver).to receive(:execute_script) do |script|
+        script_calls += 1
+        if script_calls == 1
           {'html' => '<html/>'}
-        else
-          call_count == 2 ? nil : {'html' => '<frame/>'}
+        elsif script.include?('querySelectorAll')
+          [iframe_meta(src: 'https://main.example.com/widget', percy_id: 'percy-id-1')]
+        elsif script.include?('document.URL')
+          'https://main.example.com/widget'
+        elsif script.include?('PercyDOM.serialize')
+          {'html' => '<frame/>'}
         end
       end
       allow(driver).to receive(:current_url).and_return('http://main.example.com/')
-      allow(driver).to receive(:find_elements).and_return([frame])
+      allow(driver).to receive(:find_element)
+        .with(css: 'iframe[data-percy-element-id="percy-id-1"]').and_return(frame)
 
       dom = Percy.get_serialized_dom(driver, {}, percy_dom_script: 'script')
       expect(dom).to have_key('corsIframes')
@@ -694,20 +993,22 @@ RSpec.describe Percy do
 
     it 'treats same host with different port as cross-origin' do
       frame = double('frame')
-      allow(frame).to receive(:attribute).with('src').and_return('http://main.example.com:4000/widget')
-      allow(frame).to receive(:attribute).with('data-percy-element-id').and_return('percy-id-port')
-
-      call_count = 0
-      allow(driver).to receive(:execute_script) do
-        call_count += 1
-        if call_count == 1
+      script_calls = 0
+      allow(driver).to receive(:execute_script) do |script|
+        script_calls += 1
+        if script_calls == 1
           {'html' => '<html/>'}
-        else
-          call_count == 2 ? nil : {'html' => '<frame/>'}
+        elsif script.include?('querySelectorAll')
+          [iframe_meta(src: 'http://main.example.com:4000/widget', percy_id: 'percy-id-port')]
+        elsif script.include?('document.URL')
+          'http://main.example.com:4000/widget'
+        elsif script.include?('PercyDOM.serialize')
+          {'html' => '<frame/>'}
         end
       end
       allow(driver).to receive(:current_url).and_return('http://main.example.com:3000/')
-      allow(driver).to receive(:find_elements).and_return([frame])
+      allow(driver).to receive(:find_element)
+        .with(css: 'iframe[data-percy-element-id="percy-id-port"]').and_return(frame)
 
       dom = Percy.get_serialized_dom(driver, {}, percy_dom_script: 'script')
       expect(dom).to have_key('corsIframes')
@@ -718,31 +1019,111 @@ RSpec.describe Percy do
       allow(manage).to receive(:all_cookies).and_return(cookies_data)
       allow(driver).to receive(:execute_script).and_return({'html' => '<html/>'})
       allow(driver).to receive(:current_url).and_return('http://main.example.com/')
-      allow(driver).to receive(:find_elements).and_return([])
+      allow(driver).to receive(:find_elements).with(css: 'iframe').and_return([])
 
       dom = Percy.get_serialized_dom(driver, {})
       expect(dom['cookies']).to eq(cookies_data)
     end
 
-    it 'skips same-origin frame and processes only cross-origin frame' do
-      same_frame = double('same_frame')
-      allow(same_frame).to receive(:attribute).with('src').and_return('http://main.example.com/inner')
+    it 'preserves partial capture when PercyContextLost is raised mid-walk' do
+      frame_a = double('frame_a')
+      frame_b = double('frame_b')
 
-      cross_frame = double('cross_frame')
-      allow(cross_frame).to receive(:attribute).with('src').and_return('https://other.example.com/page')
-      allow(cross_frame).to receive(:attribute).with('data-percy-element-id').and_return('cid-x')
+      partial = [{
+        'iframeData' => {'percyElementId' => 'partial-id'},
+        'iframeSnapshot' => {'html' => '<partial/>'},
+        'frameUrl' => 'https://partial.example.com/',
+      }]
+      err = Percy::PercyContextLost.new('lost context mid-walk')
+      err.partial_capture = partial
 
-      call_count = 0
-      allow(driver).to receive(:execute_script) do
-        call_count += 1
-        if call_count == 1
-          {'html' => '<main/>'}
-        else
-          call_count == 2 ? nil : {'html' => '<cross/>'}
+      script_calls = 0
+      allow(driver).to receive(:execute_script) do |script|
+        script_calls += 1
+        if script_calls == 1
+          {'html' => '<html/>'}
+        elsif script.include?('querySelectorAll')
+          [
+            iframe_meta(src: 'https://a.example.com/x', percy_id: 'cid-a'),
+            iframe_meta(src: 'https://b.example.com/y', percy_id: 'cid-b'),
+          ]
         end
       end
       allow(driver).to receive(:current_url).and_return('http://main.example.com/')
-      allow(driver).to receive(:find_elements).and_return([same_frame, cross_frame])
+      allow(driver).to receive(:find_element)
+        .with(css: 'iframe[data-percy-element-id="cid-a"]').and_return(frame_a)
+      allow(driver).to receive(:find_element)
+        .with(css: 'iframe[data-percy-element-id="cid-b"]').and_return(frame_b)
+      # First frame raises PercyContextLost with partial capture
+      allow(Percy).to receive(:process_frame_tree).and_raise(err)
+
+      dom = Percy.get_serialized_dom(driver, {}, percy_dom_script: 'script')
+      expect(dom['corsIframes']).to eq(partial)
+    end
+
+    it 'skips iframes matching ignoreIframeSelectors option' do
+      frame = double('frame')
+      captured_selectors = nil
+      script_calls = 0
+      allow(driver).to receive(:execute_script) do |script|
+        script_calls += 1
+        if script_calls == 1
+          {'html' => '<html/>'}
+        elsif script.include?('querySelectorAll')
+          captured_selectors = script
+          [iframe_meta(src: 'https://cross.example.com/x', percy_id: 'cid-z',
+                       matches_ignore: true,)]
+        end
+      end
+      allow(driver).to receive(:current_url).and_return('http://main.example.com/')
+      allow(driver).to receive(:find_elements).with(css: 'iframe').and_return([frame])
+
+      dom = Percy.get_serialized_dom(driver, {ignoreIframeSelectors: '.ad'},
+        percy_dom_script: 'script',)
+      expect(dom).to_not have_key('corsIframes')
+      # The selector list flows through to the in-browser script
+      expect(captured_selectors).to include('".ad"')
+    end
+
+    it 'skips iframes marked with data-percy-ignore' do
+      frame = double('frame')
+      script_calls = 0
+      allow(driver).to receive(:execute_script) do |script|
+        script_calls += 1
+        if script_calls == 1
+          {'html' => '<html/>'}
+        elsif script.include?('querySelectorAll')
+          [iframe_meta(src: 'https://cross.example.com/x', percy_id: 'cid-y', ignore: true)]
+        end
+      end
+      allow(driver).to receive(:current_url).and_return('http://main.example.com/')
+      allow(driver).to receive(:find_elements).with(css: 'iframe').and_return([frame])
+
+      dom = Percy.get_serialized_dom(driver, {}, percy_dom_script: 'script')
+      expect(dom).to_not have_key('corsIframes')
+    end
+
+    it 'skips same-origin frame and processes only cross-origin frame' do
+      cross_frame = double('cross_frame')
+
+      top_metas = [
+        iframe_meta(src: 'http://main.example.com/inner', percy_id: 'cid-same'),
+        iframe_meta(src: 'https://other.example.com/page', percy_id: 'cid-x'),
+      ]
+      enum_call = 0
+      allow(driver).to receive(:execute_script) do |script|
+        if script.include?('PercyDOM.serialize')
+          enum_call.zero? ? {'html' => '<main/>'} : {'html' => '<cross/>'}
+        elsif script.include?('querySelectorAll')
+          enum_call += 1
+          enum_call == 1 ? top_metas : [] # no nested children inside the cross frame
+        elsif script.include?('document.URL')
+          'https://other.example.com/page'
+        end
+      end
+      allow(driver).to receive(:current_url).and_return('http://main.example.com/')
+      allow(driver).to receive(:find_element)
+        .with(css: 'iframe[data-percy-element-id="cid-x"]').and_return(cross_frame)
 
       dom = Percy.get_serialized_dom(driver, {}, percy_dom_script: 'script')
       expect(dom['corsIframes'].length).to eq(1)
@@ -952,6 +1333,7 @@ RSpec.describe Percy do
         )
         allow(driver).to receive(:navigate).and_return(navigate)
         allow(navigate).to receive(:refresh)
+        allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(false)
       end
 
       it 'calls driver.navigate.refresh once per width' do
@@ -1376,6 +1758,47 @@ RSpec.describe Percy do
           opts = JSON.parse(req.body)['options']
           opts['sync'] == true && opts['fullPage'] == true
         }.once
+    end
+  end
+end
+
+RSpec.describe Percy do
+  describe '.capture_cors_iframes (lookup by percyElementId)' do
+    let(:driver) { instance_double('Selenium::WebDriver::Driver') }
+
+    before(:each) do
+      allow(driver).to receive(:current_url).and_return('https://example.com/')
+      # enumerate_iframes calls driver.execute_script -- return a same-origin
+      # entry followed by a CORS entry so the loop has something to skip and
+      # something to process.
+      allow(driver).to receive(:execute_script).and_return([
+        {'src' => 'https://example.com/same', 'percyElementId' => 'pid-same'},
+        {'src' => 'https://other.com/cors',   'percyElementId' => 'pid-cors'},
+      ])
+    end
+
+    it 'looks up the iframe element by data-percy-element-id, not by index' do
+      # Regression: positional alignment between the JS enumerate_iframes
+      # result and driver.find_elements(:tag_name, 'iframe') could ship one
+      # iframe's content under another's percyElementId if the DOM mutated
+      # between the two reads. The new code resolves by stable id and never
+      # calls find_elements on the iframe collection.
+      cors_element = instance_double('Selenium::WebDriver::Element')
+
+      expect(driver).to_not receive(:find_elements)
+      expect(driver).to receive(:find_element)
+        .with(css: 'iframe[data-percy-element-id="pid-cors"]')
+        .and_return(cors_element)
+
+      # Short-circuit process_frame_tree so we only verify the lookup path.
+      allow(Percy).to receive(:process_frame_tree).and_return([])
+
+      Percy.capture_cors_iframes(driver, {
+                                   max_frame_depth: 5,
+                                   ignore_selectors: [],
+                                   percy_dom_script: '',
+                                   serialize_options: {},
+                                 },)
     end
   end
 end
