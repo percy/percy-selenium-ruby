@@ -85,6 +85,14 @@ module Percy
         get_serialized_dom(driver, options, percy_dom_script: percy_dom_script)
       end
 
+      # selenium-webdriver returns execute_script string results tagged
+      # ASCII-8BIT (binary), though their bytes are valid UTF-8 (the WebDriver
+      # wire protocol is UTF-8). Without this, JSON-encoding the payload raises
+      # Encoding::UndefinedConversionError on any multibyte byte (e.g. "\xE2"
+      # from an em-dash/emoji/CSSOM). Relabel as UTF-8 (no transcode) so the
+      # snapshot posts for non-ASCII pages.
+      dom_snapshot = force_utf8(dom_snapshot)
+
       # Strip `readiness` before POSTing -- SDK-local config that the CLI
       # already has via healthcheck.
       post_options = options.reject { |k, _| k.to_s == 'readiness' }
@@ -223,6 +231,24 @@ module Percy
 
     dom_snapshot['cookies'] = get_browser_instance(driver).all_cookies
     dom_snapshot
+  end
+
+  # Recursively relabel every String in the serialized-DOM structure as UTF-8.
+  # selenium-webdriver hands back execute_script results as ASCII-8BIT; the
+  # bytes are already valid UTF-8, so force_encoding (not encode) is correct --
+  # it relabels without transcoding. Prevents Encoding::UndefinedConversionError
+  # when the payload is JSON-encoded for pages with non-ASCII content.
+  def self.force_utf8(obj)
+    case obj
+    when String
+      obj.encoding == Encoding::UTF_8 ? obj : obj.dup.force_encoding(Encoding::UTF_8)
+    when Hash
+      obj.each_with_object({}) { |(k, v), memo| memo[k] = force_utf8(v) }
+    when Array
+      obj.map { |v| force_utf8(v) }
+    else
+      obj
+    end
   end
 
   def self.unsupported_iframe_src?(src)
@@ -448,7 +474,11 @@ module Percy
     return @percy_dom unless @percy_dom.nil?
 
     response = fetch('percy/dom.js')
-    @percy_dom = response.body
+    # Net::HTTP returns the body as ASCII-8BIT; the @percy/dom bundle contains
+    # non-ASCII bytes (valid UTF-8). Relabel as UTF-8 so selenium-webdriver can
+    # JSON-encode `execute_script(percy_dom_script)` without
+    # Encoding::UndefinedConversionError under the pure-Ruby JSON generator.
+    @percy_dom = response.body.dup.force_encoding(Encoding::UTF_8)
   end
 
   def self.log(msg, lvl = 'info')
