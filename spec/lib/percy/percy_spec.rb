@@ -601,6 +601,9 @@ RSpec.describe Percy do
       allow(switch_to).to receive(:frame)
       allow(switch_to).to receive(:parent_frame)
       allow(switch_to).to receive(:default_content)
+      # Readiness gate runs execute_async_script before serialize; stub it so
+      # these unit tests exercise serialization without a real browser.
+      allow(driver).to receive(:execute_async_script).and_return(nil)
     end
 
     it 'returns the serialized dom with cookies when no iframes present' do
