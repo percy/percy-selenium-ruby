@@ -632,6 +632,42 @@ RSpec.describe Percy do
 
       Percy.process_frame(driver, frame_element, {}, 'percy_dom_script')
     end
+
+    it 'falls back to parent_frame when default_content fails in the inner ensure' do
+      allow(frame_element).to receive(:attribute).with('src')
+        .and_return('https://other.example.com/page')
+      allow(frame_element).to receive(:attribute).with('data-percy-element-id')
+        .and_return('elem-pf')
+      allow(driver).to receive(:execute_script).and_return(nil, {'html' => '<html/>'})
+      allow(switch_to).to receive(:default_content).and_raise(StandardError, 'dc boom')
+      expect(switch_to).to receive(:parent_frame).once
+
+      result = Percy.process_frame(driver, frame_element, {}, 'percy_dom_script')
+      expect(result['frameUrl']).to eq('https://other.example.com/page')
+    end
+
+    it 'swallows a parent_frame failure during inner-ensure recovery' do
+      allow(frame_element).to receive(:attribute).with('src')
+        .and_return('https://other.example.com/page')
+      allow(frame_element).to receive(:attribute).with('data-percy-element-id')
+        .and_return('elem-pf2')
+      allow(driver).to receive(:execute_script).and_return(nil, {'html' => '<html/>'})
+      allow(switch_to).to receive(:default_content).and_raise(StandardError, 'dc boom')
+      allow(switch_to).to receive(:parent_frame).and_raise(StandardError, 'pf boom')
+
+      expect { Percy.process_frame(driver, frame_element, {}, 'percy_dom_script') }
+        .to_not raise_error
+    end
+
+    it 'swallows a default_content failure in the outer rescue when frame switch fails' do
+      allow(frame_element).to receive(:attribute).with('src')
+        .and_return('https://other.example.com/page')
+      allow(switch_to).to receive(:frame).and_raise(StandardError, 'no such frame')
+      allow(switch_to).to receive(:default_content).and_raise(StandardError, 'dc boom')
+
+      result = Percy.process_frame(driver, frame_element, {}, 'percy_dom_script')
+      expect(result).to be_nil
+    end
   end
 
   describe '.get_serialized_dom' do
@@ -849,6 +885,67 @@ RSpec.describe Percy do
       expect(dom).to_not have_key('readiness_diagnostics')
       expect(dom['html']).to eq('<html/>')
     end
+
+    it 'raises the async-script timeout to match readiness timeoutMs and restores it after' do
+      timeouts = double('timeouts')
+      allow(manage).to receive(:timeouts).and_return(timeouts)
+      allow(timeouts).to receive(:script_timeout).and_return(30)
+      allow(driver).to receive(:execute_async_script).and_return(nil)
+      allow(driver).to receive(:execute_script).and_return({'html' => '<html/>'})
+      allow(driver).to receive(:current_url).and_return('http://main.example.com/')
+      allow(driver).to receive(:find_elements).and_return([])
+
+      # 8000ms -> 8s + 2s buffer is applied, then the previous 30s is restored.
+      expect(timeouts).to receive(:script_timeout=).with(10.0).ordered
+      expect(timeouts).to receive(:script_timeout=).with(30).ordered
+
+      Percy.get_serialized_dom(driver, readiness: {timeoutMs: 8000})
+    end
+
+    it 'proceeds when reading/setting the script timeout is unsupported' do
+      timeouts = double('timeouts')
+      allow(manage).to receive(:timeouts).and_return(timeouts)
+      allow(timeouts).to receive(:script_timeout).and_raise(StandardError, 'unsupported')
+      allow(driver).to receive(:execute_async_script).and_return(nil)
+      allow(driver).to receive(:execute_script).and_return({'html' => '<html/>'})
+      allow(driver).to receive(:current_url).and_return('http://main.example.com/')
+      allow(driver).to receive(:find_elements).and_return([])
+
+      expect { Percy.get_serialized_dom(driver, readiness: {timeoutMs: 5000}) }.to_not raise_error
+    end
+
+    it 'skips an iframe whose src cannot be resolved against the page url' do
+      frame = double('frame')
+      allow(frame).to receive(:attribute).with('src').and_return('ht!tp://%%%bad')
+      allow(driver).to receive(:execute_script).and_return({'html' => '<html/>'})
+      allow(driver).to receive(:current_url).and_return('http://main.example.com/')
+      allow(driver).to receive(:find_elements).and_return([frame])
+      allow(URI).to receive(:join).and_raise(URI::InvalidURIError, 'bad uri')
+
+      dom = Percy.get_serialized_dom(driver, {}, percy_dom_script: 'script')
+      expect(dom).to_not have_key('corsIframes')
+    end
+
+    it 'logs and recovers when iframe processing raises unexpectedly' do
+      allow(driver).to receive(:execute_script).and_return({'html' => '<html/>'})
+      allow(driver).to receive(:current_url).and_return('http://main.example.com/')
+      allow(driver).to receive(:find_elements).and_raise(StandardError, 'find boom')
+
+      dom = Percy.get_serialized_dom(driver, {}, percy_dom_script: 'script')
+      # find_elements raised inside the iframe block; cookies are still attached.
+      expect(dom['cookies']).to eq([])
+    end
+
+    it 'swallows a secondary error when recovering from an iframe-processing failure' do
+      allow(driver).to receive(:execute_script).and_return({'html' => '<html/>'})
+      allow(driver).to receive(:current_url).and_return('http://main.example.com/')
+      allow(driver).to receive(:find_elements).and_raise(StandardError, 'find boom')
+      # default_content also fails during recovery -> inner rescue swallows it.
+      allow(switch_to).to receive(:default_content).and_raise(StandardError, 'switch boom')
+
+      dom = Percy.get_serialized_dom(driver, {}, percy_dom_script: 'script')
+      expect(dom['cookies']).to eq([])
+    end
   end
 
   describe '.change_window_dimension_and_wait' do
@@ -1029,6 +1126,21 @@ RSpec.describe Percy do
         allow(inner_browser).to receive(:navigate).and_return(inner_nav)
         expect(inner_nav).to receive(:refresh).once
         Percy.capture_responsive_dom(driver, {})
+      end
+
+      it 'logs and continues when both the direct and fallback refresh fail' do
+        allow(Percy).to receive(:get_responsive_widths).and_return([{'width' => 375}])
+        allow(navigate).to receive(:refresh).and_raise(StandardError, 'direct refresh failed')
+
+        inner_browser = double('inner_browser')
+        inner_drv     = double('inner_driver', browser: inner_browser)
+        inner_nav     = double('inner_navigate')
+        allow(driver).to receive(:driver).and_return(inner_drv)
+        allow(inner_browser).to receive(:navigate).and_return(inner_nav)
+        allow(inner_nav).to receive(:refresh).and_raise(StandardError, 'fallback refresh failed')
+
+        expect(Percy).to receive(:log).with(/Failed to refresh page/, 'debug')
+        expect { Percy.capture_responsive_dom(driver, {}) }.to_not raise_error
       end
     end
 
@@ -1435,6 +1547,104 @@ RSpec.describe Percy do
           opts = JSON.parse(req.body)['options']
           opts['sync'] == true && opts['fullPage'] == true
         }.once
+    end
+  end
+end
+
+RSpec.describe Percy do
+  before(:each) do
+    WebMock.disable_net_connect!
+    Percy._clear_cache!
+  end
+
+  describe '.snapshot (mocked driver)' do
+    let(:driver)    { double('driver') }
+    let(:manage)    { double('manage') }
+    let(:switch_to) { double('switch_to') }
+
+    def stub_web_snapshot_healthcheck
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/healthcheck")
+        .to_return(status: 200, body: '{"success":true,"type":"web"}',
+                   headers: {'x-percy-core-version': '1.0.0'},)
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/dom.js")
+        .to_return(status: 200, body: 'window.PercyDOM = {};', headers: {})
+    end
+
+    before(:each) do
+      stub_request(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/log")
+        .to_return(status: 200, body: '', headers: {})
+      allow(driver).to receive(:manage).and_return(manage)
+      allow(manage).to receive(:all_cookies).and_return([])
+      allow(driver).to receive(:respond_to?).with(:driver).and_return(false)
+      allow(driver).to receive(:switch_to).and_return(switch_to)
+      allow(switch_to).to receive(:default_content)
+      allow(driver).to receive(:execute_async_script).and_return(nil)
+      allow(driver).to receive(:current_url).and_return('http://127.0.0.1:3003/index.html')
+      allow(driver).to receive(:find_elements).and_return([])
+      allow(driver).to receive(:execute_script) do |script|
+        {'html' => '<html/>'} if script.to_s.include?('PercyDOM.serialize')
+      end
+    end
+
+    it 'serializes the dom and posts to /percy/snapshot on the non-responsive path' do
+      stub_web_snapshot_healthcheck
+      stub_request(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/snapshot")
+        .to_return(status: 200, body: '{"success":true}')
+
+      Percy.snapshot(driver, 'MockedShot')
+
+      expect(WebMock).to have_requested(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/snapshot")
+        .with { |req| JSON.parse(req.body)['name'] == 'MockedShot' }.once
+    end
+
+    it 'logs the failure when the snapshot response success is false' do
+      stub_web_snapshot_healthcheck
+      stub_request(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/snapshot")
+        .to_return(status: 200, body: '{"success":false,"error":"server rejected"}')
+
+      # body['success'] is false -> raise body['error'] -> swallowed + logged.
+      expect { Percy.snapshot(driver, 'RejectedShot') }
+        .to output(/Could not take DOM snapshot 'RejectedShot'/).to_stdout
+    end
+  end
+
+  describe '.get_browser_instance' do
+    it 'unwraps a Capybara-style session (driver.driver.browser.manage)' do
+      inner_manage  = double('inner_manage')
+      inner_browser = double('inner_browser', manage: inner_manage)
+      inner_driver  = double('inner_driver')
+      session       = double('session')
+      allow(session).to receive(:respond_to?).with(:driver).and_return(true)
+      allow(session).to receive(:driver).and_return(inner_driver)
+      allow(inner_driver).to receive(:respond_to?).with(:browser).and_return(true)
+      allow(inner_driver).to receive(:browser).and_return(inner_browser)
+
+      expect(Percy.get_browser_instance(session)).to eq(inner_manage)
+    end
+
+    it 'uses driver.manage for a plain WebDriver session' do
+      manage = double('manage')
+      driver = double('driver', manage: manage)
+      allow(driver).to receive(:respond_to?).with(:driver).and_return(false)
+
+      expect(Percy.get_browser_instance(driver)).to eq(manage)
+    end
+  end
+
+  describe '.get_driver_metadata' do
+    it 'wraps the driver in a DriverMetaData instance' do
+      driver = double('driver')
+      expect(Percy.get_driver_metadata(driver)).to be_a(DriverMetaData)
+    end
+  end
+
+  describe '.log' do
+    it 'prints the CLI-send failure when PERCY_DEBUG is enabled' do
+      stub_const('Percy::PERCY_DEBUG', true)
+      stub_request(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/log").to_raise(StandardError)
+
+      expect { Percy.log('hello', 'debug') }
+        .to output(/Sending log to CLI Failed/).to_stdout
     end
   end
 end
