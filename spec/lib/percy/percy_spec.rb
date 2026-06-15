@@ -16,7 +16,20 @@ RSpec.describe Percy, type: :feature do
   '}};'
 
   before(:each) do
-    WebMock.disable_net_connect!(allow: '127.0.0.1', disallow: 'localhost')
+    # Allow real connections to the local WebDriver/geckodriver process and the
+    # Capybara fixture server, while stubbed percy endpoints (localhost:5338)
+    # still take precedence over a real connection.
+    #
+    # `allow_localhost: true` matches loopback by host (localhost / 127.0.0.1 /
+    # ::1). The raw `Selenium::WebDriver.for(:firefox)` session used by the
+    # "...using selenium" spec talks to geckodriver via
+    # `Selenium::WebDriver::Platform.localhost`, which resolves `localhost` via
+    # getaddrinfo and is NOT guaranteed to be the literal string "127.0.0.1" on
+    # every CI runner. The previous `allow: '127.0.0.1', disallow: 'localhost'`
+    # used pure string host matching (and `disallow:` is a silently-ignored
+    # no-op), so on CI the WebDriver command was blocked, `Percy.snapshot`
+    # swallowed the NetConnectNotAllowedError, and no snapshot POST was sent.
+    WebMock.disable_net_connect!(allow_localhost: true, allow: '127.0.0.1')
     stub_request(:post, 'http://localhost:5338/percy/log').to_raise(StandardError)
     Percy._clear_cache!
   end
