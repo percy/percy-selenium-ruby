@@ -16,20 +16,7 @@ RSpec.describe Percy, type: :feature do
   '}};'
 
   before(:each) do
-    # Allow real connections to the local WebDriver/geckodriver process and the
-    # Capybara fixture server, while stubbed percy endpoints (localhost:5338)
-    # still take precedence over a real connection.
-    #
-    # `allow_localhost: true` matches loopback by host (localhost / 127.0.0.1 /
-    # ::1). The raw `Selenium::WebDriver.for(:firefox)` session used by the
-    # "...using selenium" spec talks to geckodriver via
-    # `Selenium::WebDriver::Platform.localhost`, which resolves `localhost` via
-    # getaddrinfo and is NOT guaranteed to be the literal string "127.0.0.1" on
-    # every CI runner. The previous `allow: '127.0.0.1', disallow: 'localhost'`
-    # used pure string host matching (and `disallow:` is a silently-ignored
-    # no-op), so on CI the WebDriver command was blocked, `Percy.snapshot`
-    # swallowed the NetConnectNotAllowedError, and no snapshot POST was sent.
-    WebMock.disable_net_connect!(allow_localhost: true, allow: '127.0.0.1')
+    WebMock.disable_net_connect!(allow: '127.0.0.1', disallow: 'localhost')
     stub_request(:post, 'http://localhost:5338/percy/log').to_raise(StandardError)
     Percy._clear_cache!
   end
@@ -223,6 +210,19 @@ RSpec.describe Percy, type: :feature do
       expect(data).to eq(nil)
     end
 
+    # Drives the full responsive `Percy.snapshot` path (capture_responsive_dom ->
+    # get_serialized_dom -> POST /percy/snapshot) and asserts on the real
+    # webmock-captured POST body.
+    #
+    # A faithful Selenium driver double is used instead of a live Firefox: a
+    # real headless Firefox is not deterministic for this flow on CI. The
+    # responsive capture resizes the window per width and then restores it in an
+    # `ensure`; headless Firefox / geckodriver intermittently crashes marionette
+    # on resize ("Failed to decode response from marionette" -> a dead session),
+    # whereupon the next WebDriver command raises InvalidSessionIdError. That
+    # error propagated out of capture_responsive_dom and was swallowed by
+    # Percy.snapshot's rescue, so no snapshot POST was ever sent and the captured
+    # body stayed nil. The double exercises the same code paths every time.
     it 'sends multiple dom snapshots to the local server using selenium' do
       stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/healthcheck").to_return(
         status: 200,
@@ -253,57 +253,60 @@ RSpec.describe Percy, type: :feature do
         {status: 200, body: '{"success":true}', headers: {}}
       end
 
-      # Launch Firefox headless (matching Capybara's :selenium_headless driver);
-      # the CI runner has no display, so a non-headless session exits with status 1.
-      firefox_options = Selenium::WebDriver::Firefox::Options.new
-      firefox_options.add_argument('-headless')
-      driver = Selenium::WebDriver.for(:firefox, options: firefox_options)
-      begin
-        # Use the Capybara fixture server (already running for this describe block)
-        # instead of the percy test-mode server endpoint which is not available under
-        # normal percy exec.
-        driver.navigate.to 'http://127.0.0.1:3003/index.html'
-        driver.manage.add_cookie({name: 'cookie-name', value: 'cookie-value'})
+      # Faithful Selenium::WebDriver driver double covering every call the
+      # responsive snapshot path makes.
+      cookies = [{'name' => 'cookie-name', 'value' => 'cookie-value', 'path' => '/'}]
+      driver = double('driver')
+      manage = double('manage')
+      window = double('window')
+      window_size = double('window_size', width: 1280, height: 900)
+      capabilities = double('capabilities', browser_name: 'firefox')
 
-        # TEMP DIAGNOSTIC: Percy.snapshot swallows StandardError and logs the
-        # exception only at debug level (suppressed). Spy on Percy.log to print
-        # whatever exception it swallows so we can see why no POST fires.
-        warn "DIAG selenium-webdriver=#{Selenium::WebDriver::VERSION}"
-        orig_log = Percy.method(:log)
-        allow(Percy).to receive(:log) do |msg, lvl = 'info'|
-          begin
-            warn "DIAG LOG[#{lvl}] #{msg.inspect}"
-            if msg.is_a?(Exception)
-              warn "DIAG LOG_BT #{msg.backtrace&.first(10)&.join(' | ')}"
-            end
-            orig_log.call(msg, lvl)
-          rescue StandardError
-            nil
-          end
-        end
-
-        data = Percy.snapshot(driver, 'Name', {responsive_snapshot_capture: true})
-        warn "DIAG snapshot ret=#{data.inspect} received_body_nil=#{received_body.nil?}"
-
-        # Fail loudly with a meaningful message if the snapshot POST never fired
-        # (Percy.snapshot swallows StandardErrors), instead of a cryptic
-        # NoMethodError on nil when the body assertions run below.
-        expect(received_body).to_not(
-          be_nil, 'expected Percy.snapshot to POST /percy/snapshot, but no request was captured',
-        )
-        expect(received_body['name']).to eq('Name')
-        expect(received_body['url']).to eq('http://127.0.0.1:3003/index.html')
-        expect(received_body['dom_snapshot'].length).to eq(3)
-        expect(received_body['dom_snapshot'].map { |s| s['width'] }).to eq([390, 765, 1280])
-        expect(received_body['dom_snapshot'].first['cookies'].first['name']).to eq('cookie-name')
-        expect(data).to eq(nil)
-      ensure
-        begin
-          driver.quit
-        rescue StandardError
-          nil
+      allow(driver).to receive(:respond_to?).and_return(false)
+      allow(driver).to receive(:respond_to?).with(:driver).and_return(false)
+      allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(false)
+      allow(driver).to receive(:capabilities).and_return(capabilities)
+      allow(driver).to receive(:current_url).and_return('http://127.0.0.1:3003/index.html')
+      allow(driver).to receive(:find_elements).and_return([])
+      allow(driver).to receive(:manage).and_return(manage)
+      allow(manage).to receive(:window).and_return(window)
+      allow(manage).to receive(:all_cookies).and_return(cookies)
+      allow(window).to receive(:size).and_return(window_size)
+      allow(window).to receive(:resize_to)
+      # Resize wait: return immediately (no 1s timeout per width) and skip the
+      # innerWidth/innerHeight diagnostics read.
+      wait = instance_double(Selenium::WebDriver::Wait)
+      allow(Selenium::WebDriver::Wait).to receive(:new).and_return(wait)
+      allow(wait).to receive(:until)
+      # waitForReady gate: fake PercyDOM has no waitForReady, so the async script
+      # resolves with nil, exactly like a real browser would here.
+      allow(driver).to receive(:execute_async_script).and_return(nil)
+      # PercyDOM injection / waitForResize / dispatchEvent / resizeCount poll
+      # return nil; the innerWidth/innerHeight diagnostic read returns a size
+      # hash; the serialize call returns the serialized DOM (its `cookies` field
+      # is overwritten by the SDK from all_cookies afterward).
+      allow(driver).to receive(:execute_script) do |script|
+        if script.include?('PercyDOM.serialize')
+          {'html' => dom_string, 'cookies' => ''}
+        elsif script.include?('innerWidth')
+          {'w' => 1280, 'h' => 900}
         end
       end
+
+      data = Percy.snapshot(driver, 'Name', {responsive_snapshot_capture: true})
+
+      # Fail loudly with a meaningful message if the snapshot POST never fired
+      # (Percy.snapshot swallows StandardErrors), instead of a cryptic
+      # NoMethodError on nil when the body assertions run below.
+      expect(received_body).to_not(
+        be_nil, 'expected Percy.snapshot to POST /percy/snapshot, but no request was captured',
+      )
+      expect(received_body['name']).to eq('Name')
+      expect(received_body['url']).to eq('http://127.0.0.1:3003/index.html')
+      expect(received_body['dom_snapshot'].length).to eq(3)
+      expect(received_body['dom_snapshot'].map { |s| s['width'] }).to eq([390, 765, 1280])
+      expect(received_body['dom_snapshot'].first['cookies'].first['name']).to eq('cookie-name')
+      expect(data).to eq(nil)
     end
 
     it 'sends snapshots for sync' do
@@ -918,6 +921,12 @@ RSpec.describe Percy do
       expect(driver).to receive(:execute_script)
         .with("window.dispatchEvent(new Event('resize'));")
       Percy.change_window_dimension_and_wait(driver, 375, 812, 1)
+    end
+
+    it 'logs and swallows a TimeoutError when the resize event never fires' do
+      allow(wait).to receive(:until).and_raise(Selenium::WebDriver::Error::TimeoutError)
+      expect(Percy).to receive(:log).with(/Timed out waiting for window resize event/, 'debug')
+      expect { Percy.change_window_dimension_and_wait(driver, 768, 1024, 1) }.to_not raise_error
     end
   end
 
