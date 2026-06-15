@@ -264,8 +264,41 @@ RSpec.describe Percy, type: :feature do
         # normal percy exec.
         driver.navigate.to 'http://127.0.0.1:3003/index.html'
         driver.manage.add_cookie({name: 'cookie-name', value: 'cookie-value'})
+
+        # TEMP DIAGNOSTIC: Percy.snapshot swallows StandardError, so surface the
+        # real reason no POST fires by replaying the same live calls directly.
+        begin
+          warn "DIAG selenium-webdriver=#{Selenium::WebDriver::VERSION}"
+          warn "DIAG Platform.localhost=#{Selenium::WebDriver::Platform.localhost.inspect}"
+          script = Percy.fetch_percy_dom
+          warn "DIAG fetched dom.js len=#{script.length}"
+          driver.execute_script(script)
+          warn 'DIAG execute_script(dom) OK'
+          warn "DIAG current_url=#{driver.current_url.inspect}"
+          warn "DIAG widths=#{Percy.get_responsive_widths([]).inspect}"
+          ws = Percy.get_browser_instance(driver).window.size
+          warn "DIAG window.size=#{ws.width}x#{ws.height}"
+          driver.execute_async_script(
+            'var done = arguments[arguments.length - 1]; done();',
+          )
+          warn 'DIAG execute_async_script OK'
+          warn "DIAG all_cookies=#{Percy.get_browser_instance(driver).all_cookies.inspect}"
+          dom = Percy.get_serialized_dom(driver, {responsive_snapshot_capture: true},
+            percy_dom_script: script,)
+          warn "DIAG get_serialized_dom=#{dom.inspect}"
+        rescue Exception => e # rubocop:disable Lint/RescueException
+          warn "DIAG RAISED #{e.class}: #{e.message}"
+          warn(e.backtrace.first(8).join("\n"))
+        end
+
         data = Percy.snapshot(driver, 'Name', {responsive_snapshot_capture: true})
 
+        # Fail loudly with a meaningful message if the snapshot POST never fired
+        # (Percy.snapshot swallows StandardErrors), instead of a cryptic
+        # NoMethodError on nil when the body assertions run below.
+        expect(received_body).to_not(
+          be_nil, 'expected Percy.snapshot to POST /percy/snapshot, but no request was captured',
+        )
         expect(received_body['name']).to eq('Name')
         expect(received_body['url']).to eq('http://127.0.0.1:3003/index.html')
         expect(received_body['dom_snapshot'].length).to eq(3)
