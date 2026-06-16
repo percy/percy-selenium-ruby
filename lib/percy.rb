@@ -66,6 +66,25 @@ module Percy
     region
   end
 
+  # Recursively convert all Hash keys (at every nesting level) to symbols so
+  # config (string keys from JSON) and per-call options (symbol keys) merge on
+  # consistent keys. Arrays are walked; scalars are returned as-is.
+  def self.deep_symbolize(obj)
+    case obj
+    when Hash then obj.each_with_object({}) { |(k, v), h| h[k.to_sym] = deep_symbolize(v) }
+    when Array then obj.map { |e| deep_symbolize(e) }
+    else obj
+    end
+  end
+
+  # Deep-merge `override` onto `base`: nested Hashes merge recursively, while
+  # arrays and scalars from `override` replace those in `base`.
+  def self.deep_merge_options(base, override)
+    base.merge(override) do |_key, old_val, new_val|
+      old_val.is_a?(Hash) && new_val.is_a?(Hash) ? deep_merge_options(old_val, new_val) : new_val
+    end
+  end
+
   def self.snapshot(driver, name, options = {})
     return unless percy_enabled?
 
@@ -84,9 +103,10 @@ module Percy
       config_options = @cli_config&.dig('snapshot') || {}
       # Config keys are strings (JSON parse); per-call options use symbols, as
       # do downstream consumers (responsive_snapshot_capture?, capture_responsive_dom).
-      # Symbolize config keys so per-call options override matching config keys
-      # instead of producing duplicate logical keys (per-call options take priority).
-      merged_options = config_options.transform_keys(&:to_sym).merge(options)
+      # Deep-symbolize both sides so nested keys are consistent, then deep-merge
+      # so nested Hashes merge recursively (per-call wins at leaves; arrays/scalars
+      # replace) instead of a shallow top-level overwrite dropping config siblings.
+      merged_options = deep_merge_options(deep_symbolize(config_options), deep_symbolize(options))
 
       dom_snapshot = if responsive_snapshot_capture?(merged_options)
         capture_responsive_dom(driver, merged_options, percy_dom_script: percy_dom_script)

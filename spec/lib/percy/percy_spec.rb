@@ -240,7 +240,18 @@ RSpec.describe Percy, type: :feature do
         {status: 200, body: '{"success":true}', headers: {}}
       end
 
-      driver = Selenium::WebDriver.for :firefox
+      driver =
+        if ENV['CHROME_BIN'] && !ENV['CHROME_BIN'].empty?
+          chrome_opts = Selenium::WebDriver::Chrome::Options.new
+          chrome_opts.binary = ENV['CHROME_BIN']
+          chrome_opts.add_argument('--headless=new')
+          chrome_opts.add_argument('--no-sandbox')
+          chrome_opts.add_argument('--disable-gpu')
+          chrome_opts.add_argument('--disable-dev-shm-usage')
+          Selenium::WebDriver.for :chrome, options: chrome_opts
+        else
+          Selenium::WebDriver.for :firefox
+        end
       begin
         # Use the Capybara fixture server (already running for this describe block)
         # instead of the percy test-mode server endpoint which is not available under
@@ -335,6 +346,46 @@ RSpec.describe Percy, type: :feature do
       expect(serialized['enableJavaScript']).to eq(true)
       # ...and the per-call option wins over the config value.
       expect(serialized['percyCSS']).to eq('FROM_CALL')
+    end
+
+    it 'deep-merges nested config and per-snapshot options (sibling kept, leaf overridden)' do
+      # Config `snapshot` block carries a nested `discovery` hash; the per-call
+      # discovery only overrides one leaf, so the sibling key must survive.
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/healthcheck")
+        .to_return(
+          status: 200,
+          body: {
+            success: true,
+            config: {
+              'snapshot' => {
+                'discovery' => {'networkIdleTimeout' => 50, 'disableCache' => false},
+              },
+            },
+          }.to_json,
+          headers: {'x-percy-core-version': '1.0.0'},
+        )
+
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/dom.js")
+        .to_return(status: 200, body: fetch_script_string, headers: {})
+
+      stub_request(:post, 'http://localhost:5338/percy/snapshot')
+        .to_return(status: 200, body: '{"success":true}', headers: {})
+
+      captured_serialize_call = nil
+      allow(page).to receive(:execute_script).and_wrap_original do |original, script, *args|
+        captured_serialize_call = script if script.to_s.include?('PercyDOM.serialize')
+        original.call(script, *args)
+      end
+
+      visit 'index.html'
+      Percy.snapshot(page, 'Name', discovery: {disableCache: true})
+
+      expect(captured_serialize_call).to_not be_nil
+      serialized = JSON.parse(captured_serialize_call[/PercyDOM\.serialize\((.*)\)/m, 1])
+      # Sibling from config survives; per-call leaf overrides the config value.
+      expect(serialized['discovery']).to eq(
+        'networkIdleTimeout' => 50, 'disableCache' => true,
+      )
     end
   end
 end
