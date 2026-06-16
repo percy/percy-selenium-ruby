@@ -82,7 +82,11 @@ module Percy
 
       # Merge .percy.yml config options with snapshot options (snapshot options take priority)
       config_options = @cli_config&.dig('snapshot') || {}
-      merged_options = config_options.merge(options)
+      # Config keys are strings (JSON parse); per-call options use symbols, as
+      # do downstream consumers (responsive_snapshot_capture?, capture_responsive_dom).
+      # Symbolize config keys so per-call options override matching config keys
+      # instead of producing duplicate logical keys (per-call options take priority).
+      merged_options = config_options.transform_keys(&:to_sym).merge(options)
 
       dom_snapshot = if responsive_snapshot_capture?(merged_options)
         capture_responsive_dom(driver, merged_options, percy_dom_script: percy_dom_script)
