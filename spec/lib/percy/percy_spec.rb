@@ -297,6 +297,45 @@ RSpec.describe Percy, type: :feature do
 
       expect(data).to eq('sync_data')
     end
+
+    it 'merges .percy.yml config with per-snapshot options (per-call wins)' do
+      # Healthcheck returns a config whose `snapshot` block carries a
+      # config-only key (enableJavaScript) and a percyCSS value that the
+      # per-snapshot call will override.
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/healthcheck")
+        .to_return(
+          status: 200,
+          body: {
+            success: true,
+            config: {'snapshot' => {'enableJavaScript' => true, 'percyCSS' => 'FROM_CONFIG'}},
+          }.to_json,
+          headers: {'x-percy-core-version': '1.0.0'},
+        )
+
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/dom.js")
+        .to_return(status: 200, body: fetch_script_string, headers: {})
+
+      stub_request(:post, 'http://localhost:5338/percy/snapshot')
+        .to_return(status: 200, body: '{"success":true}', headers: {})
+
+      # Capture the argument passed to PercyDOM.serialize so we can assert how
+      # config and per-call options were merged before serialization.
+      captured_serialize_call = nil
+      allow(page).to receive(:execute_script).and_wrap_original do |original, script, *args|
+        captured_serialize_call = script if script.to_s.include?('PercyDOM.serialize')
+        original.call(script, *args)
+      end
+
+      visit 'index.html'
+      Percy.snapshot(page, 'Name', percyCSS: 'FROM_CALL')
+
+      expect(captured_serialize_call).to_not be_nil
+      serialized = JSON.parse(captured_serialize_call[/PercyDOM\.serialize\((.*)\)/m, 1])
+      # Config-only key still reaches serialize...
+      expect(serialized['enableJavaScript']).to eq(true)
+      # ...and the per-call option wins over the config value.
+      expect(serialized['percyCSS']).to eq('FROM_CALL')
+    end
   end
 end
 
