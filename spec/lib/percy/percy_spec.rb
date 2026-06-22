@@ -925,6 +925,12 @@ RSpec.describe Percy do
       allow(switch_to).to receive(:parent_frame)
       allow(switch_to).to receive(:default_content)
       allow(Percy).to receive(:log)
+      # The PER-7348 readiness gate runs PercyDOM.waitForReady via
+      # execute_async_script before serialize. Tests that aren't specifically
+      # about readiness still hit that path, so provide a harmless default
+      # no-op stub (returns nil = "gate ran, no diagnostics"). Readiness-specific
+      # tests below override this stub with their own expectations.
+      allow(driver).to receive(:execute_async_script).and_return(nil)
     end
 
     it 'returns the serialized dom with cookies when no iframes present' do
@@ -1204,7 +1210,7 @@ RSpec.describe Percy do
       allow(driver).to receive(:current_url).and_return('http://main.example.com/')
       allow(driver).to receive(:find_elements).and_return([])
 
-      Percy.get_serialized_dom(driver, readiness: {preset: 'strict', stabilityWindowMs: 500})
+      Percy.get_serialized_dom(driver, {readiness: {preset: 'strict', stabilityWindowMs: 500}})
       expect(driver).to have_received(:execute_async_script) do |script| # rubocop:disable RSpec/MessageSpies
         expect(script).to include('"preset":"strict"')
         expect(script).to include('"stabilityWindowMs":500')
@@ -1217,7 +1223,7 @@ RSpec.describe Percy do
       allow(driver).to receive(:find_elements).and_return([])
       expect(driver).to_not receive(:execute_async_script)
 
-      dom = Percy.get_serialized_dom(driver, readiness: {preset: 'disabled'})
+      dom = Percy.get_serialized_dom(driver, {readiness: {preset: 'disabled'}})
       expect(dom).to_not have_key('readiness_diagnostics')
       expect(dom['html']).to eq('<html/>')
     end
