@@ -452,6 +452,30 @@ RSpec.describe Percy do
       expect(Percy.unsupported_iframe_src?('vbscript:MsgBox()')).to be true
     end
 
+    it 'returns true for file: src' do
+      expect(Percy.unsupported_iframe_src?('file:///etc/passwd')).to be true
+    end
+
+    it 'returns true for view-source: src' do
+      expect(Percy.unsupported_iframe_src?('view-source:https://example.com')).to be true
+    end
+
+    it 'returns true for any about: prefix (e.g. about:newtab)' do
+      expect(Percy.unsupported_iframe_src?('about:newtab')).to be true
+    end
+
+    it 'returns true for devtools:, edge:, and opera: schemes' do
+      expect(Percy.unsupported_iframe_src?('devtools://devtools/bundled')).to be true
+      expect(Percy.unsupported_iframe_src?('edge://settings')).to be true
+      expect(Percy.unsupported_iframe_src?('opera://about')).to be true
+    end
+
+    it 'matches case-insensitively (mixed-case schemes still caught)' do
+      expect(Percy.unsupported_iframe_src?('JavaScript:alert(1)')).to be true
+      expect(Percy.unsupported_iframe_src?('ABOUT:BLANK')).to be true
+      expect(Percy.unsupported_iframe_src?('FILE:///etc/passwd')).to be true
+    end
+
     it 'returns false for a valid https url' do
       expect(Percy.unsupported_iframe_src?('https://example.com/page')).to be false
     end
@@ -461,10 +485,10 @@ RSpec.describe Percy do
     end
 
     it 'returns false for a src whose first segment is the literal "blank"' do
-      # Regression: the previous UNSUPPORTED_IFRAME_SRCS list contained the bare
-      # token "blank", which matched any src starting with "blank" (e.g.
-      # blanket.com/...). The about:blank case stays covered by the explicit
-      # about:blank entry.
+      # Regression: only the documented scheme prefixes (ending in ':') should
+      # match. A plain https host like blanket.com or a "blank-canvas" scheme
+      # must not be filtered just because they start with the letters "blank".
+      # The about:blank / about:newtab cases stay covered by the about: prefix.
       expect(Percy.unsupported_iframe_src?('https://blanket.com/page')).to be false
       expect(Percy.unsupported_iframe_src?('blank-canvas://x')).to be false
     end
@@ -822,6 +846,32 @@ RSpec.describe Percy do
 
       expect {
         Percy.process_frame_tree(driver, frame_element, meta, 2, Set.new, ctx)
+      }.to raise_error(Percy::PercyContextLost) { |err|
+        expect(err.partial_capture.length).to eq(1)
+      }
+    end
+
+    it 'raises PercyContextLost when parent_frame fails even at depth 1' do
+      # Regression (aligns with canonical Nightwatch/Protractor): at depth=1 the
+      # outer capture_cors_iframes loop is still iterating sibling iframe
+      # references resolved against the now-stale parent. Silently continuing
+      # would risk attaching a later iframe's content under an earlier iframe's
+      # percyElementId, so we must abort the sibling walk rather than swallow.
+      meta = meta_for(src: 'https://other.example.com/page', percy_id: 'elem-top')
+      allow(driver).to receive(:execute_script) do |script|
+        if script.include?('document.URL')
+          'https://other.example.com/page'
+        elsif script.include?('PercyDOM.serialize')
+          {'html' => '<top/>'}
+        elsif script.include?('querySelectorAll')
+          []
+        end
+      end
+      allow(driver).to receive(:find_elements).with(css: 'iframe').and_return([])
+      allow(switch_to).to receive(:parent_frame).and_raise(StandardError, 'lost context')
+
+      expect {
+        Percy.process_frame_tree(driver, frame_element, meta, 1, Set.new, ctx)
       }.to raise_error(Percy::PercyContextLost) { |err|
         expect(err.partial_capture.length).to eq(1)
       }

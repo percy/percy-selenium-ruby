@@ -9,13 +9,18 @@ require_relative 'driver_metadata'
 module Percy
   # Maximum nesting depth for cross-origin iframe recursion. Bounds the cost
   # of pathological pages and prevents runaway recursion on cyclic frame trees.
-  DEFAULT_MAX_FRAME_DEPTH = 5
+  DEFAULT_MAX_FRAME_DEPTH = 10
+
+  # Absolute ceiling on iframe nesting depth, regardless of user config. Mirrors
+  # the canonical sibling SDKs (Nightwatch/Protractor shims cap at 25).
+  HARD_MAX_FRAME_DEPTH = 25
 
   # Iframe src prefixes / sentinels we never attempt to switch into -- these
   # represent either browser-internal documents, non-HTTP URI schemes, or
   # placeholder values that have no meaningful CORS content to capture.
   UNSUPPORTED_IFRAME_SRCS = %w[
-    about:blank about:srcdoc javascript: data: vbscript: blob: chrome: chrome-extension:
+    about: chrome: chrome-extension: devtools: edge: opera: view-source:
+    data: javascript: blob: vbscript: file:
   ].freeze
 
   # Raised when a nested-frame restoration step fails and we can no longer
@@ -511,10 +516,14 @@ module Percy
       if switched_in
         # Step up exactly one level so an outer recursion continues from its
         # own context. If parent_frame fails we have no reliable way to land
-        # in the correct parent -- fall back to default_content and, if this
-        # happened inside a nested frame, raise PercyContextLost so the
-        # caller stops iterating siblings whose enumeration was performed in
-        # a now-lost context.
+        # in the correct parent -- fall back to default_content and raise
+        # PercyContextLost so the caller stops iterating siblings whose
+        # enumeration was performed in a now-lost context. We raise regardless
+        # of depth (matching canonical Nightwatch/Protractor): even at depth=1
+        # the outer capture_cors_iframes loop is mid-iteration over sibling
+        # iframe references resolved against the now-stale parent context, so
+        # silently continuing risks attaching one iframe's serialized content
+        # under another's percyElementId (a silent cross-attachment bug).
         begin
           driver.switch_to.parent_frame
         rescue StandardError => e
@@ -524,11 +533,9 @@ module Percy
           rescue StandardError
             nil
           end
-          if depth > 1
-            err = PercyContextLost.new("Lost parent frame context: #{e.message}")
-            err.partial_capture = collected
-            raise err
-          end
+          err = PercyContextLost.new("Lost parent frame context: #{e.message}")
+          err.partial_capture = collected
+          raise err
         end
       end
     end
@@ -542,7 +549,11 @@ module Percy
   def self.is_unsupported_iframe_src?(src)
     return true if src.nil? || src.to_s.empty?
 
-    UNSUPPORTED_IFRAME_SRCS.any? { |prefix| src == prefix || src.start_with?(prefix) }
+    # Match case-insensitively so mixed-case schemes (JavaScript:, FILE://,
+    # ABOUT:BLANK) are caught -- mirrors every sibling SDK, which lowercases
+    # the src before the prefix check.
+    s = src.to_s.downcase
+    UNSUPPORTED_IFRAME_SRCS.any? { |prefix| s.start_with?(prefix) }
   end
   # rubocop:enable Naming/PredicateName
 
@@ -575,7 +586,7 @@ module Percy
     return default if n.nil?
     return 0 if n < 0
 
-    [n, 50].min
+    [n, HARD_MAX_FRAME_DEPTH].min
   end
 
   # Accept selector input as String, Array, or nil and produce a flat array of
