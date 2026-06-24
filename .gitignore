@@ -16,3 +16,4 @@ mkmf.log
 Gemfile.lock
 node_modules/
 .venv/
+/vendor/
