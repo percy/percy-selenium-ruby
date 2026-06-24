@@ -294,6 +294,10 @@ module Percy
     # wait_for_ready upstream, not a PercyDOM.serialize argument.
     serialize_options = options.reject { |k, _| k.to_s == 'readiness' }
     dom_snapshot = driver.execute_script("return PercyDOM.serialize(#{serialize_options.to_json})")
+    # Guard against a non-Hash serialize result (nil/old PercyDOM) before we
+    # index into it below for readiness_diagnostics / corsIframes / cookies.
+    # Matches canonical Nightwatch behaviour (`if (!domSnapshot) domSnapshot = {}`).
+    dom_snapshot = {} unless dom_snapshot.is_a?(Hash)
     # `!nil?` preserves legitimate falsy returns like {} ("gate ran, no
     # notable diagnostics").
     if !readiness_diagnostics.nil? && dom_snapshot.is_a?(Hash)
