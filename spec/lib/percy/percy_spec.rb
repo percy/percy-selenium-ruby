@@ -814,14 +814,10 @@ RSpec.describe Percy do
 
     it 'skips frames whose document.URL post-switch is about:blank' do
       meta = meta_for(src: 'https://other.example.com/error-page', percy_id: 'elem-err')
+      # The unsupported-URL check fires right after document.URL is read, so the
+      # frame is dropped before PercyDOM.serialize / child enumeration run.
       allow(driver).to receive(:execute_script) do |script|
-        if script.include?('document.URL')
-          'about:blank' # cross-origin nav failed, landed on blank
-        elsif script.include?('PercyDOM.serialize')
-          {'html' => '<should-not-capture/>'}
-        elsif script.include?('querySelectorAll')
-          []
-        end
+        'about:blank' if script.include?('document.URL') # cross-origin nav failed
       end
       allow(driver).to receive(:find_elements).with(css: 'iframe').and_return([])
 
@@ -923,6 +919,303 @@ RSpec.describe Percy do
     end
   end
 
+  describe '.process_frame_tree (error-recovery branches)' do
+    let(:driver)        { double('driver') }
+    let(:frame_element) { double('frame_element') }
+    let(:switch_to)     { double('switch_to') }
+    let(:ctx) do
+      {
+        max_frame_depth: Percy::DEFAULT_MAX_FRAME_DEPTH,
+        ignore_selectors: [],
+        serialize_options: {},
+        percy_dom_script: 'percy_dom_script',
+      }
+    end
+
+    before(:each) do
+      allow(driver).to receive(:switch_to).and_return(switch_to)
+      allow(switch_to).to receive(:frame)
+      allow(switch_to).to receive(:parent_frame)
+      allow(switch_to).to receive(:default_content)
+      allow(Percy).to receive(:log)
+    end
+
+    def meta_for(src:, percy_id: 'elem-123')
+      {
+        'src' => src,
+        'srcdoc' => nil,
+        'percyElementId' => percy_id,
+        'dataPercyIgnore' => false,
+        'matchesIgnoreSelector' => false,
+        'index' => 0,
+      }
+    end
+
+    it 'falls back to meta src when reading document.URL post-switch raises' do
+      meta = meta_for(src: 'https://other.example.com/page', percy_id: 'elem-url')
+      allow(driver).to receive(:execute_script) do |script|
+        raise StandardError, 'document.URL unavailable' if script.include?('document.URL')
+
+        if script.include?('PercyDOM.serialize')
+          {'html' => '<frame/>'}
+        elsif script.include?('querySelectorAll')
+          []
+        end
+      end
+      allow(driver).to receive(:find_elements).with(css: 'iframe').and_return([])
+
+      result = Percy.process_frame_tree(driver, frame_element, meta, 1, Set.new, ctx)
+
+      expect(result.length).to eq(1)
+      # frame_url fell back to meta['src'] since document.URL read failed
+      expect(result[0]['frameUrl']).to eq('https://other.example.com/page')
+    end
+
+    it 'returns the partial collection when serialize returns nil' do
+      meta = meta_for(src: 'https://other.example.com/page', percy_id: 'elem-nil')
+      # serialize returns nil -> method returns early, so the child
+      # enumeration (querySelectorAll) is never reached.
+      allow(driver).to receive(:execute_script) do |script|
+        script.include?('document.URL') ? 'https://other.example.com/page' : nil
+      end
+
+      result = Percy.process_frame_tree(driver, frame_element, meta, 1, Set.new, ctx)
+      expect(result).to eq([])
+    end
+
+    it 'still recurses into children when the frame origin cannot be parsed' do
+      # frame_url contains a space so get_origin raises URI::InvalidURIError;
+      # current_origin falls back to nil, but the descent still proceeds.
+      meta = meta_for(src: 'https://other.example.com/page', percy_id: 'elem-badorigin')
+      allow(driver).to receive(:execute_script) do |script|
+        if script.include?('document.URL')
+          'http://exa mple.com/frame' # unparseable -> get_origin raises -> nil
+        elsif script.include?('PercyDOM.serialize')
+          {'html' => '<frame/>'}
+        elsif script.include?('querySelectorAll')
+          [] # no children
+        end
+      end
+      allow(driver).to receive(:find_elements).with(css: 'iframe').and_return([])
+
+      result = Percy.process_frame_tree(driver, frame_element, meta, 1, Set.new, ctx)
+      expect(result.length).to eq(1)
+    end
+
+    it 'merges an inner PercyContextLost partial capture and re-raises with the union' do
+      # A nested process_frame_tree raises PercyContextLost carrying its own
+      # partial capture. The outer level must concat that into whatever it had
+      # collected, stamp the merged set onto the error, and re-raise.
+      meta = meta_for(src: 'https://other.example.com/parent', percy_id: 'parent-id')
+      child_meta = meta_for(src: 'https://third.example.com/child', percy_id: 'child-id')
+
+      allow(driver).to receive(:execute_script) do |script|
+        if script.include?('document.URL')
+          'https://other.example.com/parent'
+        elsif script.include?('PercyDOM.serialize')
+          {'html' => '<parent/>'}
+        elsif script.include?('querySelectorAll')
+          [child_meta]
+        end
+      end
+      child_element = double('child_element')
+      allow(driver).to receive(:find_element)
+        .with(css: 'iframe[data-percy-element-id="child-id"]')
+        .and_return(child_element)
+
+      inner_partial = [{
+        'iframeData' => {'percyElementId' => 'inner-pid'},
+        'iframeSnapshot' => {'html' => '<inner/>'},
+        'frameUrl' => 'https://third.example.com/child',
+      }]
+      inner_err = Percy::PercyContextLost.new('inner loss')
+      inner_err.partial_capture = inner_partial
+
+      original = Percy.method(:process_frame_tree)
+      allow(Percy).to receive(:process_frame_tree).and_wrap_original do |_m, *args|
+        raise inner_err if args[1] == child_element
+
+        original.call(*args)
+      end
+
+      expect {
+        Percy.process_frame_tree(driver, frame_element, meta, 1, Set.new, ctx)
+      }.to raise_error(Percy::PercyContextLost) { |err|
+        # Union: the parent's own captured frame + the inner partial.
+        expect(err.partial_capture.length).to eq(2)
+        expect(err.partial_capture.map { |c| c['iframeData']['percyElementId'] })
+          .to contain_exactly('parent-id', 'inner-pid')
+      }
+    end
+
+    it 'still raises PercyContextLost when the default_content recovery also fails' do
+      # parent_frame fails, so we attempt default_content as a recovery -- but
+      # that ALSO raises. The inner failure is swallowed and PercyContextLost is
+      # raised regardless, carrying whatever was collected.
+      meta = meta_for(src: 'https://other.example.com/page', percy_id: 'elem-fallback')
+      allow(driver).to receive(:execute_script) do |script|
+        if script.include?('document.URL')
+          'https://other.example.com/page'
+        elsif script.include?('PercyDOM.serialize')
+          {'html' => '<frame/>'}
+        elsif script.include?('querySelectorAll')
+          []
+        end
+      end
+      allow(driver).to receive(:find_elements).with(css: 'iframe').and_return([])
+      allow(switch_to).to receive(:parent_frame).and_raise(StandardError, 'lost parent')
+      # The recovery attempt itself blows up -- must be swallowed.
+      allow(switch_to).to receive(:default_content)
+        .and_raise(StandardError, 'cannot reach default content')
+
+      expect {
+        Percy.process_frame_tree(driver, frame_element, meta, 2, Set.new, ctx)
+      }.to raise_error(Percy::PercyContextLost) { |err|
+        expect(err.partial_capture.length).to eq(1)
+      }
+    end
+  end
+
+  describe '.enumerate_iframes' do
+    let(:driver) { double('driver') }
+
+    before(:each) { allow(Percy).to receive(:log) }
+
+    it 'returns the array produced by the in-browser enumeration script' do
+      metas = [{'src' => 'https://a.example.com/', 'percyElementId' => 'p1'}]
+      allow(driver).to receive(:execute_script).and_return(metas)
+      expect(Percy.enumerate_iframes(driver, [])).to eq(metas)
+    end
+
+    it 'returns [] when the script returns a non-array' do
+      allow(driver).to receive(:execute_script).and_return(nil)
+      expect(Percy.enumerate_iframes(driver, [])).to eq([])
+    end
+
+    it 'swallows execute_script failures, logs at debug, and returns []' do
+      allow(driver).to receive(:execute_script)
+        .and_raise(StandardError, 'enumeration boom')
+      expect(Percy).to receive(:log)
+        .with(/Failed to enumerate iframes: enumeration boom/, 'debug')
+      expect(Percy.enumerate_iframes(driver, [])).to eq([])
+    end
+  end
+
+  describe '.should_skip_iframe? (unparseable src)' do
+    before(:each) { allow(Percy).to receive(:log) }
+
+    it 'skips the iframe when get_origin(src) raises (treated as origin nil)' do
+      # A src that passes the unsupported-scheme filter but cannot be parsed
+      # by URI -> get_origin raises -> frame_origin is nil -> skip.
+      meta = {
+        'src' => 'http://exa mple.com/page',
+        'srcdoc' => nil,
+        'percyElementId' => 'elem-bad',
+        'dataPercyIgnore' => false,
+        'matchesIgnoreSelector' => false,
+      }
+      expect(Percy.should_skip_iframe?(meta, 'http://main.example.com')).to be(true)
+    end
+  end
+
+  describe '.capture_cors_iframes (outer error recovery)' do
+    let(:driver)    { double('driver') }
+    let(:switch_to) { double('switch_to') }
+    let(:ctx) do
+      {
+        max_frame_depth: Percy::DEFAULT_MAX_FRAME_DEPTH,
+        ignore_selectors: [],
+        serialize_options: {},
+        percy_dom_script: 'percy_dom_script',
+      }
+    end
+
+    before(:each) do
+      allow(driver).to receive(:switch_to).and_return(switch_to)
+      allow(switch_to).to receive(:default_content)
+      allow(Percy).to receive(:log)
+    end
+
+    it 'swallows an unexpected failure, restores default_content, and returns []' do
+      # current_url raises -> outer rescue -> default_content restore -> [].
+      allow(driver).to receive(:current_url).and_raise(StandardError, 'driver gone')
+      expect(switch_to).to receive(:default_content)
+      expect(Percy).to receive(:log)
+        .with(/Failed to process cross-origin iframes: driver gone/, 'debug')
+
+      expect(Percy.capture_cors_iframes(driver, ctx)).to eq([])
+    end
+
+    it 'still returns [] when the default_content restore itself raises' do
+      allow(driver).to receive(:current_url).and_raise(StandardError, 'driver gone')
+      allow(switch_to).to receive(:default_content)
+        .and_raise(StandardError, 'cannot restore')
+
+      expect(Percy.capture_cors_iframes(driver, ctx)).to eq([])
+    end
+  end
+
+  describe '.clamp_frame_depth' do
+    it 'returns the default for nil input' do
+      expect(Percy.clamp_frame_depth(nil)).to eq(Percy::DEFAULT_MAX_FRAME_DEPTH)
+    end
+
+    it 'returns the default for non-numeric garbage' do
+      expect(Percy.clamp_frame_depth('not-a-number')).to eq(Percy::DEFAULT_MAX_FRAME_DEPTH)
+    end
+
+    it 'honours a custom default for unparseable input' do
+      expect(Percy.clamp_frame_depth({}, default: 4)).to eq(4)
+    end
+
+    it 'floors negative depths to zero' do
+      expect(Percy.clamp_frame_depth(-7)).to eq(0)
+    end
+
+    it 'caps oversized depths at HARD_MAX_FRAME_DEPTH' do
+      expect(Percy.clamp_frame_depth(10_000)).to eq(Percy::HARD_MAX_FRAME_DEPTH)
+    end
+
+    it 'passes through a valid in-range depth' do
+      expect(Percy.clamp_frame_depth(3)).to eq(3)
+    end
+
+    it 'coerces a numeric string within range' do
+      expect(Percy.clamp_frame_depth('5')).to eq(5)
+    end
+  end
+
+  describe '.expose_closed_shadow_roots (CDP registration failure)' do
+    let(:driver) { double('driver') }
+
+    before(:each) { allow(Percy).to receive(:log) }
+
+    it 'swallows a CDP failure during registration and logs at debug' do
+      # A closed shadow root is found, but the Runtime call to register it
+      # raises -- the whole registration block is non-fatal and only logged.
+      tree = {
+        'root' => {
+          'backendNodeId' => 1,
+          'children' => [{
+            'backendNodeId' => 2,
+            'shadowRoots' => [{
+              'backendNodeId' => 3,
+              'shadowRootType' => 'closed',
+            }],
+          }],
+        },
+      }
+      allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(true)
+      allow(driver).to receive(:execute_cdp).with('DOM.getDocument', anything).and_return(tree)
+      allow(driver).to receive(:execute_script)
+        .and_raise(StandardError, 'WeakMap setup failed')
+
+      expect(Percy).to receive(:log)
+        .with(/Could not expose closed shadow roots via CDP: WeakMap setup failed/, 'debug')
+      expect { Percy.expose_closed_shadow_roots(driver) }.to_not raise_error
+    end
+  end
+
   describe 'Percy::PercyContextLost' do
     # Regression: previous code paths could overwrite the original backtrace
     # by re-raising a new error. The exception's backtrace must point at the
@@ -979,12 +1272,10 @@ RSpec.describe Percy do
     end
 
     it 'returns the serialized dom with cookies when no iframes present' do
+      # Called without percy_dom_script, so capture_cors_iframes (and thus the
+      # iframe enumeration script) never runs -- only the top-level serialize.
       allow(driver).to receive(:execute_script) do |script|
-        if script.include?('PercyDOM.serialize')
-          {'html' => '<html/>'}
-        else
-          [] # enumerate_iframes
-        end
+        {'html' => '<html/>'} if script.include?('PercyDOM.serialize')
       end
       allow(driver).to receive(:current_url).and_return('http://main.example.com/')
       allow(driver).to receive(:find_elements).with(css: 'iframe').and_return([])
