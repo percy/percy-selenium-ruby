@@ -9,18 +9,19 @@ require_relative 'driver_metadata'
 module Percy
   # Maximum nesting depth for cross-origin iframe recursion. Bounds the cost
   # of pathological pages and prevents runaway recursion on cyclic frame trees.
-  DEFAULT_MAX_FRAME_DEPTH = 10
+  DEFAULT_MAX_FRAME_DEPTH = 3
 
   # Absolute ceiling on iframe nesting depth, regardless of user config. Mirrors
-  # the canonical sibling SDKs (Nightwatch/Protractor shims cap at 25).
-  HARD_MAX_FRAME_DEPTH = 25
+  # the canonical @percy/sdk-utils bounds (percy/cli #2319): DEFAULT 3 / HARD 10.
+  HARD_MAX_FRAME_DEPTH = 10
 
   # Iframe src prefixes / sentinels we never attempt to switch into -- these
   # represent either browser-internal documents, non-HTTP URI schemes, or
   # placeholder values that have no meaningful CORS content to capture.
+  # Mirrors the canonical @percy/sdk-utils UNSUPPORTED_IFRAME_SRCS (15 prefixes).
   UNSUPPORTED_IFRAME_SRCS = %w[
     about: chrome: chrome-extension: devtools: edge: opera: view-source:
-    data: javascript: blob: vbscript: file:
+    data: javascript: blob: vbscript: file: ws: wss: ftp:
   ].freeze
 
   # Raised when a nested-frame restoration step fails and we can no longer

@@ -505,6 +505,12 @@ RSpec.describe Percy do
       expect(Percy.unsupported_iframe_src?('view-source:https://example.com')).to be true
     end
 
+    it 'returns true for ws:, wss:, and ftp: schemes' do
+      expect(Percy.unsupported_iframe_src?('ws://example.com/socket')).to be true
+      expect(Percy.unsupported_iframe_src?('wss://example.com/socket')).to be true
+      expect(Percy.unsupported_iframe_src?('ftp://example.com/file')).to be true
+    end
+
     it 'returns true for any about: prefix (e.g. about:newtab)' do
       expect(Percy.unsupported_iframe_src?('about:newtab')).to be true
     end
