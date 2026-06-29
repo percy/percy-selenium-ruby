@@ -35,8 +35,25 @@ RSpec.configure do |config|
   Kernel.srand config.seed
 
   # See https://github.com/teamcapybara/capybara#selecting-the-driver for other options
-  Capybara.default_driver = :selenium_headless
-  Capybara.javascript_driver = :selenium_headless
+  # Default to Firefox headless (matches CI), but when a Chromium/Chrome binary is
+  # provided via CHROME_BIN (e.g. the containerised e2e image), register and use a
+  # headless Chrome driver pointing at it instead.
+  if ENV['CHROME_BIN'] && !ENV['CHROME_BIN'].empty?
+    Capybara.register_driver :selenium_chrome_headless_bin do |app|
+      options = Selenium::WebDriver::Chrome::Options.new
+      options.binary = ENV['CHROME_BIN']
+      options.add_argument('--headless=new')
+      options.add_argument('--no-sandbox')
+      options.add_argument('--disable-gpu')
+      options.add_argument('--disable-dev-shm-usage')
+      Capybara::Selenium::Driver.new(app, browser: :chrome, options: options)
+    end
+    Capybara.default_driver = :selenium_chrome_headless_bin
+    Capybara.javascript_driver = :selenium_chrome_headless_bin
+  else
+    Capybara.default_driver = :selenium_headless
+    Capybara.javascript_driver = :selenium_headless
+  end
 
   # Setup for Capybara to test Jekyll static files served by Rack
   Capybara.server_port = 3003
