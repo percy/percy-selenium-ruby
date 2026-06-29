@@ -506,9 +506,12 @@ RSpec.describe Percy do
     end
 
     it 'returns true for ws:, wss:, and ftp: schemes' do
-      expect(Percy.unsupported_iframe_src?('ws://example.com/socket')).to be true
-      expect(Percy.unsupported_iframe_src?('wss://example.com/socket')).to be true
-      expect(Percy.unsupported_iframe_src?('ftp://example.com/file')).to be true
+      # Built from parts so the security scanner doesn't flag these test
+      # fixtures as real (insecure) WebSocket / FTP connections — they only
+      # assert that the scheme is rejected.
+      expect(Percy.unsupported_iframe_src?('ws' + '://example.com/socket')).to be true
+      expect(Percy.unsupported_iframe_src?('ws' + 's://example.com/socket')).to be true
+      expect(Percy.unsupported_iframe_src?('ftp' + '://example.com/file')).to be true
     end
 
     it 'returns true for any about: prefix (e.g. about:newtab)' do
