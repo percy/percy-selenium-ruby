@@ -507,7 +507,7 @@ RSpec.describe Percy do
 
     it 'returns true for ws:, wss:, and ftp: schemes' do
       # Built from parts so the security scanner doesn't flag these test
-      # fixtures as real (insecure) WebSocket / FTP connections — they only
+      # fixtures as real (insecure) WebSocket / FTP connections. They only
       # assert that the scheme is rejected.
       expect(Percy.unsupported_iframe_src?('ws' + '://example.com/socket')).to be true
       expect(Percy.unsupported_iframe_src?('ws' + 's://example.com/socket')).to be true
