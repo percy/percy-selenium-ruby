@@ -9,6 +9,17 @@ require 'webmock/rspec'
 require 'capybara/rspec'
 require 'selenium-webdriver'
 
+# Capybara's :selenium_headless driver registers an at_exit handler that quits
+# the browser session via a real `DELETE http://127.0.0.1:4444/session/...` to
+# the local WebDriver. webmock/rspec blocks all net connections by default, so
+# that teardown raised WebMock::NetConnectNotAllowedError and failed the whole
+# process with exit code 1 even when every example passed (only intermittently,
+# because `config.order = :random` controls whether a session-starting spec runs
+# before exit). Allow localhost so session teardown and the Capybara Puma test
+# server can connect; stubbed requests still take precedence, so external HTTP
+# stays blocked.
+WebMock.disable_net_connect!(allow_localhost: true)
+
 RSpec.configure do |config|
   config.expect_with :rspec do |expectations|
     # This option will default to `true` in RSpec 4.
