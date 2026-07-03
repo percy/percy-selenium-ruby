@@ -38,6 +38,16 @@ RSpec.configure do |config|
   Capybara.default_driver = :selenium_headless
   Capybara.javascript_driver = :selenium_headless
 
+  # Capybara's built-in :selenium_headless driver still passes `options:` to
+  # driver init, which newer selenium-webdriver logs as a [DEPRECATION]
+  # [:browser_options] warning on first use. The suite asserts exact stdout
+  # via `output(...).to_stdout`, so any example that first boots the driver
+  # inside such a block fails on that extra line (seed-dependent). Silence
+  # just that deprecation id.
+  if Selenium::WebDriver.logger.respond_to?(:ignore)
+    Selenium::WebDriver.logger.ignore(:browser_options)
+  end
+
   # Setup for Capybara to test Jekyll static files served by Rack
   Capybara.server_port = 3003
   Capybara.server = :puma, { Silent: true }
