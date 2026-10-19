@@ -343,9 +343,10 @@ module Percy
 
     begin
       if driver.capabilities.browser_name == 'chrome' && driver.respond_to?(:execute_cdp)
-        driver.execute_cdp('Emulation.setDeviceMetricsOverride', {
-                             height: height, width: width, deviceScaleFactor: 1, mobile: false,
-                           },)
+        driver.execute_cdp(
+          'Emulation.setDeviceMetricsOverride',
+          height: height, width: width, deviceScaleFactor: 1, mobile: false,
+        )
       else
         get_browser_instance(driver).window.resize_to(width, height)
         driver.execute_script("window.dispatchEvent(new Event('resize'));")

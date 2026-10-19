@@ -3,6 +3,10 @@ source "https://rubygems.org"
 # Specify your gem's dependencies in percy-selenium.gemspec
 gemspec
 
+# Lets CI certify a specific Selenium release (e.g. SELENIUM_VERSION=4.50.0).
+selenium_version = ENV.fetch("SELENIUM_VERSION", "")
+gem "selenium-webdriver", selenium_version unless selenium_version.empty?
+
 gem "guard-rspec", require: false
 
 group :test, :development do

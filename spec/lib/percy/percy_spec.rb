@@ -936,7 +936,7 @@ RSpec.describe Percy do
       allow(driver).to receive(:current_url).and_return('http://main.example.com/')
       allow(driver).to receive(:find_elements).and_return([])
 
-      Percy.get_serialized_dom(driver, readiness: {preset: 'strict', stabilityWindowMs: 500})
+      Percy.get_serialized_dom(driver, {readiness: {preset: 'strict', stabilityWindowMs: 500}})
       expect(driver).to have_received(:execute_async_script) do |script| # rubocop:disable RSpec/MessageSpies
         expect(script).to include('"preset":"strict"')
         expect(script).to include('"stabilityWindowMs":500')
@@ -949,7 +949,7 @@ RSpec.describe Percy do
       allow(driver).to receive(:find_elements).and_return([])
       expect(driver).to_not receive(:execute_async_script)
 
-      dom = Percy.get_serialized_dom(driver, readiness: {preset: 'disabled'})
+      dom = Percy.get_serialized_dom(driver, {readiness: {preset: 'disabled'}})
       expect(dom).to_not have_key('readiness_diagnostics')
       expect(dom['html']).to eq('<html/>')
     end
@@ -978,7 +978,7 @@ RSpec.describe Percy do
       expect(timeouts).to receive(:script_timeout=).with(10.0).ordered
       expect(timeouts).to receive(:script_timeout=).with(30).ordered
 
-      Percy.get_serialized_dom(driver, readiness: {timeoutMs: 8000})
+      Percy.get_serialized_dom(driver, {readiness: {timeoutMs: 8000}})
     end
 
     it 'proceeds when reading/setting the script timeout is unsupported' do
@@ -990,7 +990,7 @@ RSpec.describe Percy do
       allow(driver).to receive(:current_url).and_return('http://main.example.com/')
       allow(driver).to receive(:find_elements).and_return([])
 
-      expect { Percy.get_serialized_dom(driver, readiness: {timeoutMs: 5000}) }.to_not raise_error
+      expect { Percy.get_serialized_dom(driver, {readiness: {timeoutMs: 5000}}) }.to_not raise_error
     end
 
     it 'skips an iframe whose src cannot be resolved against the page url' do
@@ -1066,9 +1066,38 @@ RSpec.describe Percy do
       allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(true)
       expect(driver).to receive(:execute_cdp).with(
         'Emulation.setDeviceMetricsOverride',
-        {height: 812, width: 375, deviceScaleFactor: 1, mobile: false},
+        height: 812, width: 375, deviceScaleFactor: 1, mobile: false,
       )
       Percy.change_window_dimension_and_wait(driver, 375, 812, 1)
+    end
+
+    # Selenium declares `execute_cdp(cmd, **params)`, so on Ruby 3 a positional
+    # Hash raises ArgumentError and the rescue silently falls back to resize_to.
+    # Run the real HasCDP method so that signature is enforced.
+    it 'sends the CDP command through the real Selenium execute_cdp on chrome' do
+      bridge = double('bridge')
+      chrome_driver = Class.new do
+        include Selenium::WebDriver::DriverExtensions::HasCDP
+
+        def capabilities; end
+
+        def manage; end
+
+        def execute_script(*)
+          {'w' => 375, 'h' => 812}
+        end
+      end.new
+      chrome_driver.instance_variable_set(:@bridge, bridge)
+      allow(chrome_driver).to receive(:capabilities)
+        .and_return(double('capabilities', browser_name: 'chrome'))
+      allow(chrome_driver).to receive(:manage).and_return(manage)
+      expect(bridge).to receive(:send_command).with(
+        cmd: 'Emulation.setDeviceMetricsOverride',
+        params: {height: 812, width: 375, deviceScaleFactor: 1, mobile: false},
+      )
+      expect(window).to_not receive(:resize_to)
+      expect(Percy).to_not receive(:log).with(/falling back/, 'debug')
+      Percy.change_window_dimension_and_wait(chrome_driver, 375, 812, 1)
     end
 
     it 'does not call resize_to when cdp succeeds for chrome' do

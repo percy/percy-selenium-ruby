@@ -16,7 +16,14 @@ jobs:
       matrix:
         os: [ubuntu-latest]
         ruby: ['2.6', '2.7']
+        selenium: ['']
+        include:
+          - os: ubuntu-latest
+            ruby: '3.3'
+            selenium: '4.50.0'
     runs-on: ${{ matrix.os }}
+    env:
+      SELENIUM_VERSION: ${{ matrix.selenium }}
     steps:
       - uses: actions-ecosystem/action-regex-match@v2
         id: regex-match
@@ -35,8 +42,8 @@ jobs:
       - uses: actions/cache@v3
         with:
           path: "./vendor/bundle"
-          key: v1/${{ runner.os }}/ruby-${{ matrix.ruby }}/${{ hashFiles('**/Gemfile.lock') }}
-          restore-keys: v1/${{ runner.os }}/ruby-${{ matrix.ruby }}/
+          key: v1/${{ runner.os }}/ruby-${{ matrix.ruby }}-selenium-${{ matrix.selenium }}/${{ hashFiles('**/Gemfile.lock') }}
+          restore-keys: v1/${{ runner.os }}/ruby-${{ matrix.ruby }}-selenium-${{ matrix.selenium }}/
       - uses: actions/setup-node@v3
         with:
           node-version: 16
