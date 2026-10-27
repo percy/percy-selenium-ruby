@@ -18,6 +18,11 @@ module Percy
   RESPONSIVE_CAPTURE_SLEEP_TIME = ENV['RESPONSIVE_CAPTURE_SLEEP_TIME'] ||
     ENV['RESONSIVE_CAPTURE_SLEEP_TIME']
 
+  CHROMIUM_BROWSERS = %w[chrome chromium msedge microsoftedge chrome-headless-shell].freeze
+  NON_CDP_BROWSERS = %w[firefox safari].freeze
+  CLOSED_SHADOW_MAX_HOSTS = 200
+  LOCAL_HOSTS = %w[localhost 127.0.0.1 ::1].freeze
+
   def self.responsive_capture_reload_page?
     val = ENV['PERCY_RESPONSIVE_CAPTURE_RELOAD_PAGE'] ||
       ENV['PERCY_RESONSIVE_CAPTURE_RELOAD_PAGE'] || 'false'
@@ -138,11 +143,7 @@ module Percy
   end
 
   def self.get_browser_instance(driver)
-    if driver.respond_to?(:driver) && driver.driver.respond_to?(:browser)
-      return driver.driver.browser.manage
-    end
-
-    driver.manage
+    native_driver(driver).manage
   end
 
   # Shallow-merge of global (@cli_config.snapshot.readiness) and per-snapshot
@@ -212,6 +213,7 @@ module Percy
     # Strip `readiness` from forwarded serialize args -- it's consumed by
     # wait_for_ready upstream, not a PercyDOM.serialize argument.
     serialize_options = options.reject { |k, _| k.to_s == 'readiness' }
+    expose_closed_shadow_roots(driver, options)
     dom_snapshot = driver.execute_script("return PercyDOM.serialize(#{serialize_options.to_json})")
     # `!nil?` preserves legitimate falsy returns like {} ("gate ran, no
     # notable diagnostics").
@@ -252,6 +254,190 @@ module Percy
 
     dom_snapshot['cookies'] = get_browser_instance(driver).all_cookies
     dom_snapshot
+  end
+
+  # @percy/dom reads closed shadow roots from window.__percyClosedShadowRoots
+  # (a WeakMap host -> root) because page JS cannot reach them. Fill it with the
+  # first strategy the session supports: CDP, then BiDi, then classic WebDriver.
+  def self.expose_closed_shadow_roots(driver, options = {})
+    return if options[:disableShadowDOM] || options['disableShadowDOM']
+
+    native = native_driver(driver)
+    return if chromium_with_cdp?(native) && expose_closed_shadow_roots_cdp(native)
+    return if bidi_session?(native) && expose_closed_shadow_roots_bidi(native)
+
+    expose_closed_shadow_roots_classic(native) if closed_shadow_classic_allowed?(native)
+  rescue StandardError => e
+    log("Could not expose closed shadow roots: #{e}", 'warn')
+  end
+
+  CLOSED_SHADOW_SET_FN = 'function(shadowRoot) { ' \
+    'window.__percyClosedShadowRoots = window.__percyClosedShadowRoots || new WeakMap(); ' \
+    'window.__percyClosedShadowRoots.set(this, shadowRoot); }'.freeze
+
+  def self.expose_closed_shadow_roots_cdp(native)
+    native.execute_cdp('DOM.enable')
+    root = native.execute_cdp('DOM.getDocument', depth: -1, pierce: true)&.dig('root')
+    return false if root.nil?
+
+    closed_shadow_pairs(root).each do |host_id, shadow_id|
+      host = native.execute_cdp('DOM.resolveNode', backendNodeId: host_id).dig('object', 'objectId')
+      shadow = native.execute_cdp('DOM.resolveNode', backendNodeId: shadow_id)
+        .dig('object', 'objectId')
+      next unless host && shadow
+
+      native.execute_cdp(
+        'Runtime.callFunctionOn',
+        functionDeclaration: CLOSED_SHADOW_SET_FN, objectId: host, arguments: [{objectId: shadow}],
+      )
+    end
+    true
+  rescue StandardError => e
+    log("Could not expose closed shadow roots via CDP: #{e}", 'debug')
+    false
+  end
+
+  # Child frame documents are skipped: their closed roots would need the
+  # WeakMap in the frame's own realm.
+  def self.closed_shadow_pairs(node, pairs = [])
+    return pairs if node.nil? || node['contentDocument']
+
+    (node['shadowRoots'] || []).each do |shadow|
+      if shadow['shadowRootType'] == 'closed'
+        pairs << [node['backendNodeId'], shadow['backendNodeId']]
+      end
+      closed_shadow_pairs(shadow, pairs)
+    end
+    (node['children'] || []).each { |child| closed_shadow_pairs(child, pairs) }
+    pairs
+  end
+
+  # Open roots are walked in-page; each closed root found needs another call
+  # because page JS cannot see into it.
+  BIDI_SHADOW_CANDIDATES_FN = '(root) => { const out = []; ' \
+    'const hostable = ' \
+    '/^(article|aside|blockquote|body|div|footer|h[1-6]|header|main|nav|p|section|span)$/; ' \
+    'const walk = (r) => { for (const e of r.querySelectorAll("*")) { ' \
+    'if (e.shadowRoot) walk(e.shadowRoot); ' \
+    'else if (e.localName.includes("-") || hostable.test(e.localName)) out.push(e); } }; ' \
+    'walk(root || document); return out; }'.freeze
+  BIDI_SHADOW_SET_FN = '(pairs) => { ' \
+    'const m = window.__percyClosedShadowRoots = ' \
+    'window.__percyClosedShadowRoots || new WeakMap(); ' \
+    'for (const [h, s] of pairs) m.set(h, s); }'.freeze
+
+  # Selenium Ruby has no typed script module, so this uses the raw BiDi command.
+  def self.expose_closed_shadow_roots_bidi(native)
+    context = native.window_handle
+    scopes = [nil]
+    exposed = 0
+    until scopes.empty?
+      scope = scopes.shift
+      args = scope ? [{sharedId: scope}] : []
+      nodes = bidi_call_function(native, context, BIDI_SHADOW_CANDIDATES_FN, args)['value'] || []
+      pairs = nodes.map do |node|
+        shadow = node.dig('value', 'shadowRoot')
+        [node['sharedId'], shadow['sharedId']] if shadow && shadow.dig('value', 'mode') == 'closed'
+      end.compact
+      next if pairs.empty?
+
+      refs = pairs.map do |host, shadow|
+        {type: 'array', value: [{sharedId: host}, {sharedId: shadow}]}
+      end
+      bidi_call_function(native, context, BIDI_SHADOW_SET_FN, [{type: 'array', value: refs}])
+      exposed += pairs.length
+      break if exposed >= closed_shadow_max_hosts
+
+      scopes.concat(pairs.map(&:last))
+    end
+    true
+  rescue StandardError => e
+    log("Could not expose closed shadow roots via BiDi: #{e}", 'debug')
+    false
+  end
+
+  def self.bidi_call_function(native, context, function, args)
+    response = native.bidi.send_cmd(
+      'script.callFunction',
+      functionDeclaration: function, awaitPromise: false, target: {context: context},
+      arguments: args, resultOwnership: 'none',
+      serializationOptions: {maxDomDepth: 0, includeShadowTree: 'all'},
+    )
+    unless response['type'] == 'success'
+      raise StandardError, "script.callFunction #{response['type']}"
+    end
+
+    response['result'] || {}
+  end
+
+  CLASSIC_SHADOW_CANDIDATES_JS = 'const out = []; ' \
+    'const walk = (r) => { for (const e of r.querySelectorAll("*")) { ' \
+    'if (e.shadowRoot) walk(e.shadowRoot); else if (e.localName.includes("-")) out.push(e); } }; ' \
+    'walk(arguments[0] || document); return out;'.freeze
+  CLASSIC_SHADOW_SET_JS = '(window.__percyClosedShadowRoots = ' \
+    'window.__percyClosedShadowRoots || new WeakMap()).set(arguments[0], arguments[1]);'.freeze
+
+  # W3C Get Element Shadow Root returns closed roots too. It costs one round
+  # trip per candidate, hence the cap and the local-only default.
+  def self.expose_closed_shadow_roots_classic(native)
+    max_hosts = closed_shadow_max_hosts
+    checked = 0
+    scopes = [nil]
+    capped = false
+    until scopes.empty? || capped
+      hosts = native.execute_script(CLASSIC_SHADOW_CANDIDATES_JS, scopes.shift) || []
+      hosts.each do |host|
+        capped = checked >= max_hosts
+        break if capped
+
+        checked += 1
+        shadow = element_shadow_root(host)
+        next if shadow.nil?
+
+        native.execute_script(CLASSIC_SHADOW_SET_JS, host, shadow)
+        scopes << shadow
+      end
+    end
+    return unless capped
+
+    log("Closed shadow root scan stopped at #{max_hosts} hosts (PERCY_CLOSED_SHADOW_MAX_HOSTS)",
+      'debug',)
+  end
+
+  # NoSuchShadowRoot means "not a host"; Safari answers null, which the
+  # binding cannot wrap. Both mean skip.
+  def self.element_shadow_root(host)
+    host.shadow_root
+  rescue StandardError
+    nil
+  end
+
+  def self.closed_shadow_max_hosts
+    value = Integer(ENV['PERCY_CLOSED_SHADOW_MAX_HOSTS'] || CLOSED_SHADOW_MAX_HOSTS)
+    value > 0 ? value : CLOSED_SHADOW_MAX_HOSTS
+  rescue ArgumentError, TypeError
+    CLOSED_SHADOW_MAX_HOSTS
+  end
+
+  # Remote grids add a full round trip per candidate, so classic is opt-in there.
+  def self.closed_shadow_classic_allowed?(native)
+    return true if ENV['PERCY_CLOSED_SHADOW_CLASSIC'] == 'true'
+    return true if LOCAL_HOSTS.include?(command_executor_host(native))
+
+    unless @closed_shadow_remote_logged
+      @closed_shadow_remote_logged = true
+      log('closed shadow roots skipped on remote session; start the session with ' \
+          'webSocketUrl: true or set PERCY_CLOSED_SHADOW_CLASSIC=true')
+    end
+    false
+  end
+
+  def self.command_executor_host(native)
+    return nil unless native.respond_to?(:bridge, true)
+
+    URI.parse(native.send(:bridge).http.send(:server_url).to_s).hostname
+  rescue StandardError
+    nil
   end
 
   def self.unsupported_iframe_src?(src)
@@ -338,32 +524,212 @@ module Percy
     end
   end
 
-  def self.change_window_dimension_and_wait(driver, width, height, resize_count)
+  # Returns the mechanism that was used (:cdp, :bidi or :window) so the caller
+  # can undo exactly that on restore.
+  def self.change_window_dimension_and_wait(driver, width, height, exact: true)
     log("Attempting to resize window to #{width}x#{height}", 'debug')
 
-    begin
-      if driver.capabilities.browser_name == 'chrome' && driver.respond_to?(:execute_cdp)
-        driver.execute_cdp('Emulation.setDeviceMetricsOverride', {
-                             height: height, width: width, deviceScaleFactor: 1, mobile: false,
-                           },)
-      else
-        get_browser_instance(driver).window.resize_to(width, height)
-        driver.execute_script("window.dispatchEvent(new Event('resize'));")
-      end
-    rescue StandardError => e
-      log("Resizing using cdp failed, falling back to driver for width #{width} #{e}", 'debug')
-      get_browser_instance(driver).window.resize_to(width, height)
-      driver.execute_script("window.dispatchEvent(new Event('resize'));")
+    mechanism = if exact
+      set_exact_viewport(driver, width, height)
+    else
+      legacy_resize(driver, width, height)
     end
 
-    begin
-      wait = Selenium::WebDriver::Wait.new(timeout: 1)
-      wait.until { driver.execute_script('return window.resizeCount') == resize_count }
-      actual_size = driver.execute_script('return { w: window.innerWidth, h: window.innerHeight }')
-      log("Resize successful. New Viewport Size: #{actual_size['w']}x#{actual_size['h']}", 'debug')
-    rescue Selenium::WebDriver::Error::TimeoutError
-      log("Timed out waiting for window resize event for width #{width}", 'debug')
+    actual = wait_for_viewport_width(driver, width)
+    if exact && mechanism == :window && actual && actual != width
+      warn_viewport_mismatch(driver, width, actual)
     end
+    mechanism
+  end
+
+  # CDP and BiDi emulate the viewport exactly. A window resize cannot go below
+  # the OS minimum window width (~500px) and includes browser chrome (Edge has
+  # an 8px border), so it is only the last resort.
+  def self.set_exact_viewport(driver, width, height)
+    native = native_driver(driver)
+
+    if chromium_with_cdp?(native)
+      begin
+        native.execute_cdp(
+          'Emulation.setDeviceMetricsOverride',
+          height: height, width: width, deviceScaleFactor: 1, mobile: false,
+        )
+        return :cdp
+      rescue StandardError => e
+        log("CDP viewport override failed for width #{width}: #{e}", 'debug')
+      end
+    end
+
+    if bidi_session?(native)
+      begin
+        native.bidi.send_cmd(
+          'browsingContext.setViewport',
+          context: native.window_handle,
+          viewport: {width: width, height: height},
+          devicePixelRatio: 1,
+        )
+        return :bidi
+      rescue StandardError => e
+        log("BiDi viewport override failed for width #{width}: #{e}", 'debug')
+      end
+    end
+
+    resize_window_to_viewport(driver, width, height)
+    :window
+  end
+
+  # exactResponsiveWidth: false keeps the pre-exact behaviour: CDP on Chrome
+  # only, otherwise a plain window resize.
+  def self.legacy_resize(driver, width, height)
+    native = native_driver(driver)
+    if browser_name(native) == 'chrome' && native.respond_to?(:execute_cdp)
+      native.execute_cdp(
+        'Emulation.setDeviceMetricsOverride',
+        height: height, width: width, deviceScaleFactor: 1, mobile: false,
+      )
+      return :cdp
+    end
+
+    resize_window(driver, width, height)
+    :window
+  rescue StandardError => e
+    log("Resizing using cdp failed, falling back to driver for width #{width} #{e}", 'debug')
+    resize_window(driver, width, height)
+    :window
+  end
+
+  def self.resize_window(driver, width, height)
+    get_browser_instance(driver).window.resize_to(width, height)
+    driver.execute_script("window.dispatchEvent(new Event('resize'));")
+  end
+
+  def self.resize_window_to_viewport(driver, width, height)
+    resize_window(driver, width, height)
+    actual = viewport_size(driver)['w']
+    # Only a too-narrow viewport (window border) can be corrected; a wider one
+    # means the OS minimum window width was hit.
+    return if actual.nil? || actual >= width
+
+    resize_window(driver, width + (width - actual), height)
+  end
+
+  def self.restore_viewport(driver, width, height, mechanisms)
+    mechanisms = mechanisms.compact.uniq
+    native = native_driver(driver)
+    resize = mechanisms.include?(:window)
+
+    if mechanisms.include?(:cdp)
+      begin
+        native.execute_cdp('Emulation.clearDeviceMetricsOverride')
+      rescue StandardError => e
+        log("Could not clear CDP viewport override: #{e}", 'debug')
+        resize = true
+      end
+    end
+
+    if mechanisms.include?(:bidi)
+      begin
+        clear_bidi_viewport(native)
+      rescue StandardError => e
+        log("Could not clear BiDi viewport override: #{e}", 'debug')
+        resize = true
+      end
+    end
+
+    get_browser_instance(driver).window.resize_to(width, height) if resize
+  end
+
+  # BiDi#send_cmd drops nil params, but resetting the viewport needs an
+  # explicit `viewport: null`, so this goes through the raw socket.
+  def self.clear_bidi_viewport(native)
+    bidi = native.bidi
+    raise StandardError, 'BiDi binding cannot send a null viewport' unless bidi.respond_to?(:ws)
+
+    message = bidi.ws.send_cmd(
+      method: 'browsingContext.setViewport',
+      params: {context: native.window_handle, viewport: nil, devicePixelRatio: nil},
+    )
+    raise StandardError, message['message'].to_s if message && message['error']
+  end
+
+  # Never raises: the override is already applied when this runs, and the
+  # caller must get the mechanism back so restore_viewport can undo it.
+  def self.viewport_size(driver)
+    driver.execute_script('return { w: window.innerWidth, h: window.innerHeight }') || {}
+  rescue StandardError => e
+    log("Could not read viewport size: #{e}", 'debug')
+    {}
+  end
+
+  def self.wait_for_viewport_width(driver, width)
+    begin
+      Selenium::WebDriver::Wait.new(timeout: 1).until { viewport_size(driver)['w'] == width }
+    rescue Selenium::WebDriver::Error::TimeoutError
+      log("Timed out waiting for viewport width #{width}", 'debug')
+    end
+    size = viewport_size(driver)
+    log("New Viewport Size: #{size['w']}x#{size['h']}", 'debug')
+    size['w']
+  end
+
+  def self.warn_viewport_mismatch(driver, width, actual)
+    log("Viewport width is #{actual} instead of #{width} after window resize", 'debug')
+    native = native_driver(driver)
+    session = session_id_of(native)
+    @viewport_warned_sessions ||= {}
+    return if @viewport_warned_sessions[session]
+
+    @viewport_warned_sessions[session] = true
+    log("#{browser_name(native)} could not be resized to exact responsive widths " \
+        "(got #{actual}px for #{width}px). Start the session with `webSocketUrl: true` " \
+        'to enable WebDriver BiDi for exact widths.', 'warn',)
+  end
+
+  def self.session_id_of(native)
+    native.session_id
+  rescue StandardError
+    nil
+  end
+
+  def self.exact_responsive_width?(options)
+    [
+      options[:exactResponsiveWidth],
+      options[:exact_responsive_width],
+      @cli_config&.dig('snapshot', 'exactResponsiveWidth'),
+    ].each { |value| return value unless value.nil? }
+    true
+  end
+
+  def self.native_driver(driver)
+    if driver.respond_to?(:driver) && driver.driver.respond_to?(:browser)
+      return driver.driver.browser
+    end
+
+    driver
+  end
+
+  def self.browser_name(native)
+    native.capabilities.browser_name.to_s.downcase
+  rescue StandardError
+    ''
+  end
+
+  def self.chromium_with_cdp?(native)
+    return false unless native.respond_to?(:execute_cdp)
+
+    name = browser_name(native)
+    CHROMIUM_BROWSERS.include?(name) || !NON_CDP_BROWSERS.include?(name)
+  end
+
+  # Only a session that was started with `webSocketUrl: true` has a BiDi
+  # socket; the SDK cannot enable it after the fact.
+  def self.bidi_session?(native)
+    return false unless native.respond_to?(:bidi) && native.respond_to?(:capabilities)
+
+    caps = native.capabilities
+    (caps[:web_socket_url] || caps['webSocketUrl']).is_a?(String)
+  rescue StandardError
+    false
   end
 
   def self.capture_responsive_dom(driver, options, percy_dom_script: nil)
@@ -374,7 +740,8 @@ module Percy
     current_height = window_size.height
     last_window_width = current_width
     last_window_height = current_height
-    resize_count = 0
+    exact = exact_responsive_width?(options)
+    mechanisms = []
     driver.execute_script('PercyDOM.waitForResize()')
     target_height = current_height
 
@@ -394,8 +761,7 @@ module Percy
         height = width_dict['height'] || target_height
 
         if last_window_width != width || last_window_height != height
-          resize_count += 1
-          change_window_dimension_and_wait(driver, width, height, resize_count)
+          mechanisms << change_window_dimension_and_wait(driver, width, height, exact: exact)
           last_window_width = width
           last_window_height = height
         end
@@ -414,7 +780,6 @@ module Percy
           percy_dom_script = fetch_percy_dom
           driver.execute_script(percy_dom_script)
           driver.execute_script('PercyDOM.waitForResize()')
-          resize_count = 0
         end
 
         sleep(RESPONSIVE_CAPTURE_SLEEP_TIME.to_i) if RESPONSIVE_CAPTURE_SLEEP_TIME
@@ -424,7 +789,7 @@ module Percy
         dom_snapshots << dom_snapshot
       end
     ensure
-      change_window_dimension_and_wait(driver, current_width, current_height, resize_count + 1)
+      restore_viewport(driver, current_width, current_height, mechanisms)
     end
 
     dom_snapshots
@@ -580,6 +945,8 @@ module Percy
     @percy_enabled = nil
     @cli_config = nil
     @session_type = nil
+    @viewport_warned_sessions = nil
+    @closed_shadow_remote_logged = nil
     Cache.clear_cache!
   end
 end
