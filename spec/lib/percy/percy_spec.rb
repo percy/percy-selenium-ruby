@@ -266,6 +266,7 @@ RSpec.describe Percy, type: :feature do
       allow(driver).to receive(:respond_to?).with(:driver).and_return(false)
       allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(false)
       allow(driver).to receive(:capabilities).and_return(capabilities)
+      allow(driver).to receive(:session_id).and_return('session-1')
       allow(driver).to receive(:current_url).and_return('http://127.0.0.1:3003/index.html')
       allow(driver).to receive(:find_elements).and_return([])
       allow(driver).to receive(:manage).and_return(manage)
@@ -764,6 +765,17 @@ RSpec.describe Percy do
       # Readiness gate runs execute_async_script before serialize; stub it so
       # these unit tests exercise serialization without a real browser.
       allow(driver).to receive(:execute_async_script).and_return(nil)
+      allow(Percy).to receive(:expose_closed_shadow_roots)
+    end
+
+    it 'exposes closed shadow roots before serializing' do
+      allow(driver).to receive(:current_url).and_return('http://main.example.com/')
+      allow(driver).to receive(:find_elements).and_return([])
+      expect(Percy).to receive(:expose_closed_shadow_roots)
+        .with(driver, {disableShadowDOM: true}).ordered
+      expect(driver).to receive(:execute_script)
+        .with(/PercyDOM.serialize/).ordered.and_return({'html' => '<html/>'})
+      Percy.get_serialized_dom(driver, {disableShadowDOM: true})
     end
 
     it 'returns the serialized dom with cookies when no iframes present' do
@@ -1033,105 +1045,304 @@ RSpec.describe Percy do
     let(:window)        { double('window') }
     let(:wait)          { instance_double(Selenium::WebDriver::Wait) }
     let(:caps_firefox)  { double('capabilities', browser_name: 'firefox') }
+    let(:inner_width)   { [1024] }
 
     before(:each) do
+      allow(driver).to receive(:respond_to?).and_return(false)
       allow(driver).to receive(:manage).and_return(manage)
       allow(manage).to receive(:window).and_return(window)
       allow(window).to receive(:resize_to)
       allow(driver).to receive(:capabilities).and_return(caps_firefox)
-      allow(driver).to receive(:respond_to?).with(:driver).and_return(false)
-      allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(false)
+      allow(driver).to receive(:session_id).and_return('s-1')
       allow(driver).to receive(:execute_script) do |script|
-        {'w' => 1024, 'h' => 768} if script.include?('innerWidth')
+        {'w' => inner_width.first, 'h' => 768} if script.include?('innerWidth')
       end
       allow(Selenium::WebDriver::Wait).to receive(:new).and_return(wait)
-      allow(wait).to receive(:until)
+      allow(wait).to receive(:until).and_yield
       allow(Percy).to receive(:log)
     end
 
-    it 'resizes the window using resize_to for non-chrome browsers' do
-      expect(window).to receive(:resize_to).with(768, 1024)
-      Percy.change_window_dimension_and_wait(driver, 768, 1024, 1)
-    end
+    def chrome_driver_with_bridge(bridge, browser: 'chrome', window_double: nil)
+      klass = Class.new do
+        include Selenium::WebDriver::DriverExtensions::HasCDP
 
-    it 'dispatches a resize event after resizing for non-chrome browsers' do
-      expect(driver).to receive(:execute_script)
-        .with("window.dispatchEvent(new Event('resize'));")
-      Percy.change_window_dimension_and_wait(driver, 768, 1024, 1)
-    end
+        attr_accessor :caps, :mgr
 
-    it 'uses execute_cdp for chrome when execute_cdp is available' do
-      chrome_caps = double('capabilities', browser_name: 'chrome')
-      allow(driver).to receive(:capabilities).and_return(chrome_caps)
-      allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(true)
-      expect(driver).to receive(:execute_cdp).with(
-        'Emulation.setDeviceMetricsOverride',
-        height: 812, width: 375, deviceScaleFactor: 1, mobile: false,
-      )
-      Percy.change_window_dimension_and_wait(driver, 375, 812, 1)
+        def capabilities
+          caps
+        end
+
+        def manage
+          mgr
+        end
+
+        def execute_script(*)
+          {'w' => 375, 'h' => 812}
+        end
+      end
+      chromium = klass.new
+      chromium.instance_variable_set(:@bridge, bridge)
+      chromium.caps = double('capabilities', browser_name: browser)
+      chromium.mgr = double('manage', window: window_double || window)
+      chromium
     end
 
     # Selenium declares `execute_cdp(cmd, **params)`, so on Ruby 3 a positional
     # Hash raises ArgumentError and the rescue silently falls back to resize_to.
     # Run the real HasCDP method so that signature is enforced.
-    it 'sends the CDP command through the real Selenium execute_cdp on chrome' do
-      bridge = double('bridge')
-      chrome_driver = Class.new do
-        include Selenium::WebDriver::DriverExtensions::HasCDP
+    %w[chrome MicrosoftEdge msedge].each do |browser|
+      it "overrides the viewport through the real execute_cdp on #{browser}" do
+        bridge = double('bridge')
+        chromium = chrome_driver_with_bridge(bridge, browser: browser)
+        expect(bridge).to receive(:send_command).with(
+          cmd: 'Emulation.setDeviceMetricsOverride',
+          params: {height: 812, width: 375, deviceScaleFactor: 1, mobile: false},
+        )
+        expect(window).to_not receive(:resize_to)
+        expect(Percy.change_window_dimension_and_wait(chromium, 375, 812)).to eq(:cdp)
+      end
+    end
 
-        def capabilities; end
+    it 'never uses CDP on firefox even when the driver exposes it' do
+      allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(true)
+      expect(driver).to_not receive(:execute_cdp)
+      inner_width[0] = 768
+      expect(Percy.change_window_dimension_and_wait(driver, 768, 1024)).to eq(:window)
+    end
 
-        def manage; end
-
-        def execute_script(*)
-          {'w' => 375, 'h' => 812}
-        end
-      end.new
-      chrome_driver.instance_variable_set(:@bridge, bridge)
-      allow(chrome_driver).to receive(:capabilities)
-        .and_return(double('capabilities', browser_name: 'chrome'))
-      allow(chrome_driver).to receive(:manage).and_return(manage)
-      expect(bridge).to receive(:send_command).with(
-        cmd: 'Emulation.setDeviceMetricsOverride',
-        params: {height: 812, width: 375, deviceScaleFactor: 1, mobile: false},
+    it 'uses CDP for an unknown browser name when the driver exposes it' do
+      allow(driver).to receive(:capabilities).and_return(double('caps', browser_name: 'brave'))
+      allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(true)
+      expect(driver).to receive(:execute_cdp).with(
+        'Emulation.setDeviceMetricsOverride',
+        height: 812, width: 375, deviceScaleFactor: 1, mobile: false,
       )
-      expect(window).to_not receive(:resize_to)
-      expect(Percy).to_not receive(:log).with(/falling back/, 'debug')
-      Percy.change_window_dimension_and_wait(chrome_driver, 375, 812, 1)
+      Percy.change_window_dimension_and_wait(driver, 375, 812)
     end
 
-    it 'does not call resize_to when cdp succeeds for chrome' do
-      chrome_caps = double('capabilities', browser_name: 'chrome')
-      allow(driver).to receive(:capabilities).and_return(chrome_caps)
-      allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(true)
-      allow(driver).to receive(:execute_cdp)
-      expect(window).to_not receive(:resize_to)
-      Percy.change_window_dimension_and_wait(driver, 375, 812, 1)
+    context 'with a BiDi session' do
+      let(:bidi) { double('bidi') }
+
+      before(:each) do
+        caps = {web_socket_url: 'wss://127.0.0.1:9222/session/abc'}
+        allow(driver).to receive(:capabilities).and_return(caps)
+        allow(driver).to receive(:respond_to?).with(:bidi).and_return(true)
+        allow(driver).to receive(:respond_to?).with(:capabilities).and_return(true)
+        allow(driver).to receive(:bidi).and_return(bidi)
+        allow(driver).to receive(:window_handle).and_return('ctx-1')
+      end
+
+      it 'sets the viewport with browsingContext.setViewport' do
+        expect(bidi).to receive(:send_cmd).with(
+          'browsingContext.setViewport',
+          context: 'ctx-1', viewport: {width: 375, height: 812}, devicePixelRatio: 1,
+        )
+        expect(window).to_not receive(:resize_to)
+        inner_width[0] = 375
+        expect(Percy.change_window_dimension_and_wait(driver, 375, 812)).to eq(:bidi)
+      end
+
+      it 'falls back to the window when setViewport fails' do
+        allow(bidi).to receive(:send_cmd).and_raise(StandardError, 'unknown command')
+        expect(window).to receive(:resize_to).with(1024, 812)
+        expect(Percy.change_window_dimension_and_wait(driver, 1024, 812)).to eq(:window)
+      end
     end
 
-    it 'falls back to resize_to when execute_cdp raises' do
-      chrome_caps = double('capabilities', browser_name: 'chrome')
-      allow(driver).to receive(:capabilities).and_return(chrome_caps)
+    it 'falls back to BiDi or the window when CDP raises' do
+      allow(driver).to receive(:capabilities).and_return(double('caps', browser_name: 'chrome'))
       allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(true)
       allow(driver).to receive(:execute_cdp).and_raise(StandardError, 'cdp error')
-      expect(window).to receive(:resize_to).with(375, 812)
-      Percy.change_window_dimension_and_wait(driver, 375, 812, 1)
+      expect(window).to receive(:resize_to).with(1024, 812)
+      expect(Percy).to receive(:log).with(/CDP viewport override failed/, 'debug')
+      expect(Percy.change_window_dimension_and_wait(driver, 1024, 812)).to eq(:window)
     end
 
-    it 'dispatches a resize event in the cdp fallback path' do
-      chrome_caps = double('capabilities', browser_name: 'chrome')
-      allow(driver).to receive(:capabilities).and_return(chrome_caps)
-      allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(true)
-      allow(driver).to receive(:execute_cdp).and_raise(StandardError, 'cdp error')
-      expect(driver).to receive(:execute_script)
-        .with("window.dispatchEvent(new Event('resize'));")
-      Percy.change_window_dimension_and_wait(driver, 375, 812, 1)
+    it 'corrects the window size by the measured border once' do
+      inner_width[0] = 1272
+      expect(window).to receive(:resize_to).with(1280, 900).ordered
+      expect(window).to receive(:resize_to).with(1288, 900).ordered do
+        inner_width[0] = 1280
+      end
+      expect(Percy.change_window_dimension_and_wait(driver, 1280, 900)).to eq(:window)
     end
 
-    it 'logs and swallows a TimeoutError when the resize event never fires' do
+    it 'warns once per session when the window cannot reach the width' do
+      inner_width[0] = 500
       allow(wait).to receive(:until).and_raise(Selenium::WebDriver::Error::TimeoutError)
-      expect(Percy).to receive(:log).with(/Timed out waiting for window resize event/, 'debug')
-      expect { Percy.change_window_dimension_and_wait(driver, 768, 1024, 1) }.to_not raise_error
+      expect(Percy).to receive(:log).with(/webSocketUrl: true/, 'warn').once
+      expect(Percy).to receive(:log).with(/Timed out waiting for viewport width 375/, 'debug').twice
+      2.times { Percy.change_window_dimension_and_wait(driver, 375, 900) }
+    end
+
+    it 'still warns when the session id is unavailable' do
+      inner_width[0] = 500
+      allow(driver).to receive(:session_id).and_raise(StandardError)
+      expect(Percy).to receive(:log).with(/firefox could not be resized/, 'warn')
+      Percy.change_window_dimension_and_wait(driver, 375, 900)
+    end
+
+    it 'does not correct the window when innerWidth is unknown' do
+      allow(driver).to receive(:execute_script).and_return(nil)
+      expect(window).to receive(:resize_to).once
+      Percy.change_window_dimension_and_wait(driver, 375, 900)
+    end
+
+    context 'with exact: false' do
+      it 'uses CDP only for chrome, through the real execute_cdp' do
+        bridge = double('bridge')
+        chromium = chrome_driver_with_bridge(bridge)
+        expect(bridge).to receive(:send_command).with(
+          cmd: 'Emulation.setDeviceMetricsOverride',
+          params: {height: 812, width: 375, deviceScaleFactor: 1, mobile: false},
+        )
+        expect(Percy.change_window_dimension_and_wait(chromium, 375, 812, exact: false)).to eq(:cdp)
+      end
+
+      it 'resizes the window for Edge and dispatches a resize event' do
+        bridge = double('bridge')
+        edge = chrome_driver_with_bridge(bridge, browser: 'MicrosoftEdge')
+        expect(bridge).to_not receive(:send_command)
+        expect(window).to receive(:resize_to).with(375, 812).once
+        expect(Percy.change_window_dimension_and_wait(edge, 375, 812, exact: false)).to eq(:window)
+      end
+
+      it 'falls back to resize_to when execute_cdp raises' do
+        allow(driver).to receive(:capabilities).and_return(double('caps', browser_name: 'chrome'))
+        allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(true)
+        allow(driver).to receive(:execute_cdp).and_raise(StandardError, 'cdp error')
+        expect(window).to receive(:resize_to).with(375, 812)
+        expect(driver).to receive(:execute_script)
+          .with("window.dispatchEvent(new Event('resize'));")
+        expect(Percy).to_not receive(:log).with(anything, 'warn')
+        expect(Percy.change_window_dimension_and_wait(driver, 375, 812, exact: false))
+          .to eq(:window)
+      end
+    end
+  end
+
+  describe '.restore_viewport' do
+    let(:driver) { double('driver') }
+    let(:window) { double('window') }
+
+    before(:each) do
+      allow(driver).to receive(:respond_to?).and_return(false)
+      allow(driver).to receive(:manage).and_return(double('manage', window: window))
+      allow(Percy).to receive(:log)
+    end
+
+    it 'clears the CDP override through the real execute_cdp instead of re-applying it' do
+      bridge = double('bridge')
+      chromium = Class.new { include Selenium::WebDriver::DriverExtensions::HasCDP }.new
+      chromium.instance_variable_set(:@bridge, bridge)
+      expect(bridge).to receive(:send_command)
+        .with(cmd: 'Emulation.clearDeviceMetricsOverride', params: {})
+      Percy.restore_viewport(chromium, 1280, 900, [:cdp, nil, :cdp])
+    end
+
+    it 'resizes the window back when the window was used' do
+      expect(window).to receive(:resize_to).with(1280, 900)
+      Percy.restore_viewport(driver, 1280, 900, [:window])
+    end
+
+    it 'does nothing when nothing was resized' do
+      expect(window).to_not receive(:resize_to)
+      Percy.restore_viewport(driver, 1280, 900, [])
+    end
+
+    it 'resizes the window when clearing CDP fails' do
+      allow(driver).to receive(:execute_cdp).and_raise(StandardError, 'gone')
+      expect(window).to receive(:resize_to).with(1280, 900)
+      Percy.restore_viewport(driver, 1280, 900, [:cdp])
+    end
+
+    context 'with BiDi' do
+      let(:bidi) { double('bidi') }
+      let(:ws)   { double('ws') }
+
+      before(:each) do
+        allow(driver).to receive(:bidi).and_return(bidi)
+        allow(driver).to receive(:window_handle).and_return('ctx-1')
+      end
+
+      it 'sends an explicit null viewport over the socket' do
+        allow(bidi).to receive(:respond_to?).with(:ws).and_return(true)
+        allow(bidi).to receive(:ws).and_return(ws)
+        expect(ws).to receive(:send_cmd).with(
+          method: 'browsingContext.setViewport',
+          params: {context: 'ctx-1', viewport: nil, devicePixelRatio: nil},
+        ).and_return({'id' => 1, 'result' => {}})
+        expect(window).to_not receive(:resize_to)
+        Percy.restore_viewport(driver, 1280, 900, [:bidi])
+      end
+
+      it 'resizes the window when the reset returns an error' do
+        allow(bidi).to receive(:respond_to?).with(:ws).and_return(true)
+        allow(bidi).to receive(:ws).and_return(ws)
+        allow(ws).to receive(:send_cmd).and_return({'error' => 'x', 'message' => 'bad'})
+        expect(window).to receive(:resize_to).with(1280, 900)
+        expect(Percy).to receive(:log).with(/Could not clear BiDi viewport override: bad/, 'debug')
+        Percy.restore_viewport(driver, 1280, 900, [:bidi])
+      end
+
+      it 'resizes the window when the binding has no raw socket' do
+        allow(bidi).to receive(:respond_to?).with(:ws).and_return(false)
+        expect(window).to receive(:resize_to).with(1280, 900)
+        Percy.restore_viewport(driver, 1280, 900, [:bidi])
+      end
+    end
+  end
+
+  describe '.exact_responsive_width?' do
+    after(:each) { Percy.instance_variable_set(:@cli_config, nil) }
+
+    it 'defaults to true' do
+      expect(Percy.exact_responsive_width?({})).to eq(true)
+    end
+
+    it 'prefers the per-snapshot option over the CLI config' do
+      Percy.instance_variable_set(:@cli_config, {'snapshot' => {'exactResponsiveWidth' => true}})
+      expect(Percy.exact_responsive_width?({exactResponsiveWidth: false})).to eq(false)
+      expect(Percy.exact_responsive_width?({exact_responsive_width: false})).to eq(false)
+    end
+
+    it 'reads config.snapshot.exactResponsiveWidth from the healthcheck' do
+      Percy.instance_variable_set(:@cli_config, {'snapshot' => {'exactResponsiveWidth' => false}})
+      expect(Percy.exact_responsive_width?({})).to eq(false)
+    end
+  end
+
+  describe '.bidi_session?' do
+    let(:driver) { double('driver') }
+
+    before(:each) do
+      allow(driver).to receive(:respond_to?).and_return(true)
+    end
+
+    it 'is false without a webSocketUrl capability' do
+      allow(driver).to receive(:capabilities).and_return({web_socket_url: true})
+      expect(Percy.bidi_session?(driver)).to eq(false)
+    end
+
+    it 'accepts the string-keyed capability' do
+      allow(driver).to receive(:capabilities).and_return({'webSocketUrl' => 'wss://x'})
+      expect(Percy.bidi_session?(driver)).to eq(true)
+    end
+
+    it 'is false when the binding has no bidi' do
+      allow(driver).to receive(:respond_to?).with(:bidi).and_return(false)
+      expect(Percy.bidi_session?(driver)).to eq(false)
+    end
+
+    it 'is false when capabilities cannot be read' do
+      allow(driver).to receive(:capabilities).and_raise(StandardError)
+      expect(Percy.bidi_session?(driver)).to eq(false)
+    end
+  end
+
+  describe '.browser_name' do
+    it 'returns an empty string when capabilities are unavailable' do
+      expect(Percy.browser_name(Object.new)).to eq('')
     end
   end
 
@@ -1150,6 +1361,7 @@ RSpec.describe Percy do
       allow(driver).to receive(:execute_script).and_return(nil)
       allow(Percy).to receive(:get_serialized_dom).and_return({'html' => '<html/>'})
       allow(Percy).to receive(:change_window_dimension_and_wait)
+      allow(Percy).to receive(:restore_viewport)
       allow(Percy).to receive(:log)
     end
 
@@ -1161,8 +1373,7 @@ RSpec.describe Percy do
       allow(Percy).to receive(:get_responsive_widths).and_return(
         [{'width' => 375}, {'width' => 768}, {'width' => 1280}],
       )
-      # Each of the 3 widths differs from the previous + final restore = 4 calls
-      expect(Percy).to receive(:change_window_dimension_and_wait).exactly(4).times
+      expect(Percy).to receive(:change_window_dimension_and_wait).exactly(3).times
       Percy.capture_responsive_dom(driver, {})
     end
 
@@ -1170,15 +1381,15 @@ RSpec.describe Percy do
       allow(Percy).to receive(:get_responsive_widths).and_return(
         [{'width' => 375}, {'width' => 375}],
       )
-      # 375 (first, differs from 1280) + final restore = 2; second 375 skipped
-      expect(Percy).to receive(:change_window_dimension_and_wait).twice
+      # second 375 is skipped
+      expect(Percy).to receive(:change_window_dimension_and_wait).once
       Percy.capture_responsive_dom(driver, {})
     end
 
     it 'passes the requested width and window height to change_window_dimension_and_wait' do
       allow(Percy).to receive(:get_responsive_widths).and_return([{'width' => 390}])
       expect(Percy).to receive(:change_window_dimension_and_wait)
-        .with(driver, 390, 900, anything)
+        .with(driver, 390, 900, exact: true)
       Percy.capture_responsive_dom(driver, {})
     end
 
@@ -1187,15 +1398,22 @@ RSpec.describe Percy do
         [{'width' => 390, 'height' => 844}],
       )
       expect(Percy).to receive(:change_window_dimension_and_wait)
-        .with(driver, 390, 844, anything)
+        .with(driver, 390, 844, exact: true)
       Percy.capture_responsive_dom(driver, {})
     end
 
-    it 'restores original window dimensions after processing all widths' do
+    it 'restores the viewport with the mechanisms that were used' do
+      allow(Percy).to receive(:get_responsive_widths).and_return([{'width' => 375}])
+      allow(Percy).to receive(:change_window_dimension_and_wait).and_return(:cdp)
+      expect(Percy).to receive(:restore_viewport).with(driver, 1280, 900, [:cdp])
+      Percy.capture_responsive_dom(driver, {})
+    end
+
+    it 'passes exact: false when exactResponsiveWidth is disabled' do
       allow(Percy).to receive(:get_responsive_widths).and_return([{'width' => 375}])
       expect(Percy).to receive(:change_window_dimension_and_wait)
-        .with(driver, 1280, 900, anything)
-      Percy.capture_responsive_dom(driver, {})
+        .with(driver, 375, 900, exact: false)
+      Percy.capture_responsive_dom(driver, {exactResponsiveWidth: false})
     end
 
     # -----------------------------------------------------------------------
@@ -1264,7 +1482,7 @@ RSpec.describe Percy do
 
       it 'uses the minHeight option as the target height' do
         expect(Percy).to receive(:change_window_dimension_and_wait)
-          .with(driver, 390, 800, anything)
+          .with(driver, 390, 800, exact: true)
         Percy.capture_responsive_dom(driver, {minHeight: 800})
       end
 
@@ -1272,7 +1490,7 @@ RSpec.describe Percy do
         begin
           Percy.instance_variable_set(:@cli_config, {'snapshot' => {'minHeight' => 700}})
           expect(Percy).to receive(:change_window_dimension_and_wait)
-            .with(driver, 390, 700, anything)
+            .with(driver, 390, 700, exact: true)
           Percy.capture_responsive_dom(driver, {})
         ensure
           Percy.instance_variable_set(:@cli_config, nil)
@@ -1281,7 +1499,7 @@ RSpec.describe Percy do
 
       it 'uses the current window height unchanged when minHeight is not set' do
         expect(Percy).to receive(:change_window_dimension_and_wait)
-          .with(driver, 390, 900, anything)
+          .with(driver, 390, 900, exact: true)
         Percy.capture_responsive_dom(driver, {})
       end
     end
@@ -1690,7 +1908,7 @@ RSpec.describe Percy do
         .to_return(status: 200, body: '', headers: {})
       allow(driver).to receive(:manage).and_return(manage)
       allow(manage).to receive(:all_cookies).and_return([])
-      allow(driver).to receive(:respond_to?).with(:driver).and_return(false)
+      allow(driver).to receive(:respond_to?).and_return(false)
       allow(driver).to receive(:switch_to).and_return(switch_to)
       allow(switch_to).to receive(:default_content)
       allow(driver).to receive(:execute_async_script).and_return(nil)
@@ -1764,3 +1982,338 @@ RSpec.describe Percy do
   end
 end
 # rubocop:enable RSpec/MultipleDescribes
+
+RSpec.describe Percy do
+  before(:each) do
+    Percy._clear_cache!
+    allow(Percy).to receive(:log)
+  end
+
+  describe '.expose_closed_shadow_roots' do
+    let(:driver) { double('driver') }
+
+    before(:each) do
+      allow(driver).to receive(:respond_to?).and_return(false)
+      allow(driver).to receive(:capabilities).and_return(double('caps', browser_name: 'firefox'))
+    end
+
+    it 'does nothing when disableShadowDOM is set' do
+      expect(Percy).to_not receive(:closed_shadow_classic_allowed?)
+      Percy.expose_closed_shadow_roots(driver, {disableShadowDOM: true})
+      Percy.expose_closed_shadow_roots(driver, {'disableShadowDOM' => true})
+    end
+
+    it 'unwraps a Capybara session to the Selenium driver' do
+      browser = double('browser')
+      allow(driver).to receive(:respond_to?).with(:driver).and_return(true)
+      allow(driver).to receive(:driver).and_return(double('cap_driver', browser: browser))
+      expect(Percy).to receive(:closed_shadow_classic_allowed?).with(browser).and_return(false)
+      allow(browser).to receive(:respond_to?).and_return(false)
+      Percy.expose_closed_shadow_roots(driver)
+    end
+
+    it 'stops after CDP succeeds' do
+      allow(driver).to receive(:capabilities).and_return(double('caps', browser_name: 'chrome'))
+      allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(true)
+      expect(Percy).to receive(:expose_closed_shadow_roots_cdp).and_return(true)
+      expect(Percy).to_not receive(:closed_shadow_classic_allowed?)
+      Percy.expose_closed_shadow_roots(driver)
+    end
+
+    it 'stops after BiDi succeeds' do
+      allow(Percy).to receive(:bidi_session?).and_return(true)
+      expect(Percy).to receive(:expose_closed_shadow_roots_bidi).and_return(true)
+      expect(Percy).to_not receive(:closed_shadow_classic_allowed?)
+      Percy.expose_closed_shadow_roots(driver)
+    end
+
+    it 'falls back to classic when CDP and BiDi fail' do
+      allow(driver).to receive(:capabilities).and_return(double('caps', browser_name: 'chrome'))
+      allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(true)
+      allow(Percy).to receive(:bidi_session?).and_return(true)
+      allow(Percy).to receive(:expose_closed_shadow_roots_cdp).and_return(false)
+      allow(Percy).to receive(:expose_closed_shadow_roots_bidi).and_return(false)
+      allow(Percy).to receive(:closed_shadow_classic_allowed?).and_return(true)
+      expect(Percy).to receive(:expose_closed_shadow_roots_classic).with(driver)
+      Percy.expose_closed_shadow_roots(driver)
+    end
+
+    it 'warns and continues on unexpected errors' do
+      allow(Percy).to receive(:closed_shadow_classic_allowed?).and_raise(StandardError, 'boom')
+      expect(Percy).to receive(:log).with(/Could not expose closed shadow roots: boom/, 'warn')
+      expect { Percy.expose_closed_shadow_roots(driver) }.to_not raise_error
+    end
+  end
+
+  describe '.expose_closed_shadow_roots_cdp' do
+    let(:bridge) { double('bridge') }
+    let(:chromium) do
+      d = Class.new { include Selenium::WebDriver::DriverExtensions::HasCDP }.new
+      d.instance_variable_set(:@bridge, bridge)
+      d
+    end
+    let(:document) do
+      {'root' => {
+        'backendNodeId' => 1,
+        'children' => [
+          {'backendNodeId' => 2, 'shadowRoots' => [
+            {'backendNodeId' => 3, 'shadowRootType' => 'closed', 'children' => [
+              {'backendNodeId' => 4, 'shadowRoots' => [
+                {'backendNodeId' => 5, 'shadowRootType' => 'closed'},
+              ],},
+            ],},
+          ],},
+          {'backendNodeId' => 6,
+           'shadowRoots' => [{'backendNodeId' => 7, 'shadowRootType' => 'open'}],},
+          {'backendNodeId' => 8, 'contentDocument' => {}, 'shadowRoots' => [
+            {'backendNodeId' => 9, 'shadowRootType' => 'closed'},
+          ],},
+        ],
+      }}
+    end
+
+    def cdp(cmd, params = {})
+      receive(:send_command).with(cmd: cmd, params: params)
+    end
+
+    # Driven through the real HasCDP#execute_cdp so keyword arguments are enforced.
+    it 'maps every closed root (including nested ones) to its host via keyword CDP calls' do
+      expect(bridge).to cdp('DOM.enable')
+      expect(bridge).to cdp('DOM.getDocument', depth: -1, pierce: true).and_return(document)
+      [2, 3, 4, 5].each do |id|
+        expect(bridge).to cdp('DOM.resolveNode', backendNodeId: id)
+          .and_return({'object' => {'objectId' => "obj-#{id}"}})
+      end
+      expect(bridge).to_not cdp('DOM.resolveNode', backendNodeId: 9)
+      [[2, 3], [4, 5]].each do |host, shadow|
+        expect(bridge).to cdp(
+          'Runtime.callFunctionOn',
+          functionDeclaration: Percy::CLOSED_SHADOW_SET_FN, objectId: "obj-#{host}",
+          arguments: [{objectId: "obj-#{shadow}"}],
+        )
+      end
+      expect(Percy.expose_closed_shadow_roots_cdp(chromium)).to eq(true)
+    end
+
+    it 'skips pairs that cannot be resolved' do
+      allow(bridge).to cdp('DOM.enable')
+      allow(bridge).to cdp('DOM.getDocument', depth: -1, pierce: true).and_return(document)
+      allow(bridge).to receive(:send_command).with(cmd: 'DOM.resolveNode', params: anything)
+        .and_return({'object' => {}})
+      expect(bridge).to_not receive(:send_command)
+        .with(cmd: 'Runtime.callFunctionOn', params: anything)
+      expect(Percy.expose_closed_shadow_roots_cdp(chromium)).to eq(true)
+    end
+
+    it 'returns false when the document has no root' do
+      allow(bridge).to cdp('DOM.enable')
+      allow(bridge).to cdp('DOM.getDocument', depth: -1, pierce: true).and_return({})
+      expect(Percy.expose_closed_shadow_roots_cdp(chromium)).to eq(false)
+    end
+
+    it 'returns false and logs when CDP fails' do
+      allow(bridge).to receive(:send_command).and_raise(StandardError, 'no cdp')
+      expect(Percy).to receive(:log).with(/via CDP: no cdp/, 'debug')
+      expect(Percy.expose_closed_shadow_roots_cdp(chromium)).to eq(false)
+    end
+  end
+
+  describe '.expose_closed_shadow_roots_bidi' do
+    let(:driver) { double('driver', window_handle: 'ctx-1') }
+    let(:ws)     { double('ws') }
+    # Same signature and body as Selenium's BiDi#send_cmd(method, **params), so
+    # a positional Hash raises like it would against the real binding (which
+    # the Ruby 2.x CI rows' Selenium predates).
+    let(:bidi) do
+      Class.new do
+        def initialize(ws)
+          @ws = ws
+        end
+
+        def send_cmd(method, **params)
+          @ws.send_cmd(method: method, params: params.compact)['result']
+        end
+      end.new(ws)
+    end
+
+    def node(id, mode = nil)
+      root = {'sharedId' => "#{id}-root", 'value' => {'mode' => mode}}
+      value = mode ? {'shadowRoot' => root} : {}
+      {'type' => 'node', 'sharedId' => id, 'value' => value}
+    end
+
+    def success(value)
+      {'result' => {'type' => 'success', 'result' => {'type' => 'array', 'value' => value}}}
+    end
+
+    before(:each) do
+      allow(driver).to receive(:bidi).and_return(bidi)
+    end
+
+    it 'exposes closed roots and recurses into each one' do
+      calls = []
+      allow(ws).to receive(:send_cmd) do |method:, params:|
+        calls << [method, params]
+        case calls.length
+        when 1 then success([node('h1', 'closed'), node('h2', 'open'), node('h3')])
+        when 3 then success([node('h4', 'closed')])
+        else success([])
+        end
+      end
+
+      expect(Percy.expose_closed_shadow_roots_bidi(driver)).to eq(true)
+
+      expect(calls.map(&:first).uniq).to eq(['script.callFunction'])
+      first = calls[0][1]
+      expect(first[:target]).to eq({context: 'ctx-1'})
+      expect(first[:serializationOptions]).to eq({maxDomDepth: 0, includeShadowTree: 'all'})
+      expect(first[:arguments]).to eq([])
+      expect(calls[1][1][:arguments]).to eq([{type: 'array', value: [
+        {type: 'array', value: [{sharedId: 'h1'}, {sharedId: 'h1-root'}]},
+      ],}])
+      expect(calls[2][1][:arguments]).to eq([{sharedId: 'h1-root'}])
+      expect(calls[4][1][:arguments]).to eq([{sharedId: 'h4-root'}])
+      expect(calls.length).to eq(5)
+    end
+
+    it 'stops at PERCY_CLOSED_SHADOW_MAX_HOSTS' do
+      allow(Percy).to receive(:closed_shadow_max_hosts).and_return(1)
+      calls = 0
+      allow(ws).to receive(:send_cmd) do
+        calls += 1
+        success([node('h1', 'closed')])
+      end
+      expect(Percy.expose_closed_shadow_roots_bidi(driver)).to eq(true)
+      expect(calls).to eq(2)
+    end
+
+    it 'returns false when the script throws' do
+      allow(ws).to receive(:send_cmd)
+        .and_return({'result' => {'type' => 'exception', 'exceptionDetails' => {}}})
+      expect(Percy).to receive(:log).with(/via BiDi: script.callFunction exception/, 'debug')
+      expect(Percy.expose_closed_shadow_roots_bidi(driver)).to eq(false)
+    end
+
+    it 'tolerates an empty result' do
+      allow(ws).to receive(:send_cmd).and_return({'result' => {'type' => 'success'}})
+      expect(Percy.expose_closed_shadow_roots_bidi(driver)).to eq(true)
+    end
+  end
+
+  describe '.expose_closed_shadow_roots_classic' do
+    let(:driver) { double('driver') }
+
+    def host(shadow)
+      h = double('host')
+      if shadow == :none
+        allow(h).to receive(:shadow_root)
+          .and_raise(Selenium::WebDriver::Error::WebDriverError, 'no such shadow root')
+      else
+        allow(h).to receive(:shadow_root).and_return(shadow)
+      end
+      h
+    end
+
+    it 'sets each closed root and walks into it; null roots (Safari) are skipped' do
+      root = double('root')
+      nested_root = double('nested_root')
+      closed = host(root)
+      plain = host(:none)
+      safari = host(nil)
+      nested = host(nested_root)
+      allow(driver).to receive(:execute_script)
+        .with(Percy::CLASSIC_SHADOW_CANDIDATES_JS, nil).and_return([closed, plain, safari])
+      allow(driver).to receive(:execute_script)
+        .with(Percy::CLASSIC_SHADOW_CANDIDATES_JS, root).and_return([nested])
+      allow(driver).to receive(:execute_script)
+        .with(Percy::CLASSIC_SHADOW_CANDIDATES_JS, nested_root).and_return(nil)
+      expect(driver).to receive(:execute_script).with(Percy::CLASSIC_SHADOW_SET_JS, closed, root)
+      expect(driver).to receive(:execute_script)
+        .with(Percy::CLASSIC_SHADOW_SET_JS, nested, nested_root)
+      Percy.expose_closed_shadow_roots_classic(driver)
+    end
+
+    it 'stops at the host cap and logs' do
+      allow(Percy).to receive(:closed_shadow_max_hosts).and_return(1)
+      first = host(:none)
+      second = host(:none)
+      allow(driver).to receive(:execute_script).and_return([first, second])
+      expect(second).to_not receive(:shadow_root)
+      expect(Percy).to receive(:log).with(/stopped at 1 hosts/, 'debug')
+      Percy.expose_closed_shadow_roots_classic(driver)
+    end
+  end
+
+  describe '.closed_shadow_max_hosts' do
+    around(:each) do |example|
+      original = ENV['PERCY_CLOSED_SHADOW_MAX_HOSTS']
+      example.run
+      ENV['PERCY_CLOSED_SHADOW_MAX_HOSTS'] = original
+    end
+
+    it 'defaults to 200 and honours valid overrides' do
+      ENV.delete('PERCY_CLOSED_SHADOW_MAX_HOSTS')
+      expect(Percy.closed_shadow_max_hosts).to eq(200)
+      ENV['PERCY_CLOSED_SHADOW_MAX_HOSTS'] = '5'
+      expect(Percy.closed_shadow_max_hosts).to eq(5)
+    end
+
+    it 'ignores invalid values' do
+      ENV['PERCY_CLOSED_SHADOW_MAX_HOSTS'] = '0'
+      expect(Percy.closed_shadow_max_hosts).to eq(200)
+      ENV['PERCY_CLOSED_SHADOW_MAX_HOSTS'] = 'many'
+      expect(Percy.closed_shadow_max_hosts).to eq(200)
+    end
+  end
+
+  describe '.closed_shadow_classic_allowed?' do
+    let(:driver) { double('driver') }
+
+    around(:each) do |example|
+      original = ENV['PERCY_CLOSED_SHADOW_CLASSIC']
+      ENV.delete('PERCY_CLOSED_SHADOW_CLASSIC')
+      example.run
+      ENV['PERCY_CLOSED_SHADOW_CLASSIC'] = original
+    end
+
+    def executor(url)
+      allow(Percy).to receive(:command_executor_host).and_call_original
+      http = double('http')
+      allow(http).to receive(:server_url).and_return(URI(url))
+      bridge = double('bridge', http: http)
+      allow(driver).to receive(:respond_to?).with(:bridge, true).and_return(true)
+      allow(driver).to receive(:bridge).and_return(bridge)
+    end
+
+    ['http://localhost:9515', 'http://127.0.0.1:4444/wd/hub', 'http://[::1]:9515'].each do |url|
+      it "allows local executor #{url}" do
+        executor(url)
+        expect(Percy.closed_shadow_classic_allowed?(driver)).to eq(true)
+      end
+    end
+
+    it 'treats an unknown executor as remote' do
+      expect(Percy.closed_shadow_classic_allowed?(Object.new)).to eq(false)
+    end
+
+    it 'treats an unreadable executor as remote' do
+      allow(driver).to receive(:respond_to?).with(:bridge, true).and_return(true)
+      allow(driver).to receive(:bridge).and_raise(StandardError)
+      expect(Percy.closed_shadow_classic_allowed?(driver)).to eq(false)
+    end
+
+    it 'skips remote sessions and logs once at info' do
+      executor('https://hub-cloud.browserstack.com/wd/hub')
+      message = 'closed shadow roots skipped on remote session; start the session with ' \
+        'webSocketUrl: true or set PERCY_CLOSED_SHADOW_CLASSIC=true'
+      expect(Percy).to receive(:log).with(message).once
+      2.times { expect(Percy.closed_shadow_classic_allowed?(driver)).to eq(false) }
+    end
+
+    it 'allows remote sessions with PERCY_CLOSED_SHADOW_CLASSIC=true' do
+      ENV['PERCY_CLOSED_SHADOW_CLASSIC'] = 'true'
+      expect(Percy).to_not receive(:command_executor_host)
+      expect(Percy.closed_shadow_classic_allowed?(driver)).to eq(true)
+    end
+  end
+end
