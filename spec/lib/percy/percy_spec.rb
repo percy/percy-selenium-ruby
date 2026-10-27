@@ -1188,6 +1188,22 @@ RSpec.describe Percy do
       Percy.change_window_dimension_and_wait(driver, 375, 900)
     end
 
+    it 'does not shrink the window again when the OS minimum width was hit' do
+      inner_width[0] = 500
+      expect(window).to receive(:resize_to).with(200, 900).once
+      Percy.change_window_dimension_and_wait(driver, 200, 900)
+    end
+
+    it 'still returns the mechanism when reading the viewport fails' do
+      allow(driver).to receive(:capabilities).and_return(double('caps', browser_name: 'chrome'))
+      allow(driver).to receive(:respond_to?).with(:execute_cdp).and_return(true)
+      allow(driver).to receive(:execute_cdp)
+      allow(driver).to receive(:execute_script).and_raise(StandardError, 'unexpected alert')
+      expect(Percy).to receive(:log).with(/Could not read viewport size: unexpected alert/, 'debug')
+        .at_least(:once)
+      expect(Percy.change_window_dimension_and_wait(driver, 375, 900)).to eq(:cdp)
+    end
+
     context 'with exact: false' do
       it 'uses CDP only for chrome, through the real execute_cdp' do
         bridge = double('bridge')

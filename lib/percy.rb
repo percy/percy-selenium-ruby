@@ -536,7 +536,7 @@ module Percy
     end
 
     actual = wait_for_viewport_width(driver, width)
-    if exact && mechanism == :window && actual != width
+    if exact && mechanism == :window && actual && actual != width
       warn_viewport_mismatch(driver, width, actual)
     end
     mechanism
@@ -606,7 +606,9 @@ module Percy
   def self.resize_window_to_viewport(driver, width, height)
     resize_window(driver, width, height)
     actual = viewport_size(driver)['w']
-    return if actual.nil? || actual == width
+    # Only a too-narrow viewport (window border) can be corrected; a wider one
+    # means the OS minimum window width was hit.
+    return if actual.nil? || actual >= width
 
     resize_window(driver, width + (width - actual), height)
   end
@@ -650,8 +652,13 @@ module Percy
     raise StandardError, message['message'].to_s if message && message['error']
   end
 
+  # Never raises: the override is already applied when this runs, and the
+  # caller must get the mechanism back so restore_viewport can undo it.
   def self.viewport_size(driver)
     driver.execute_script('return { w: window.innerWidth, h: window.innerHeight }') || {}
+  rescue StandardError => e
+    log("Could not read viewport size: #{e}", 'debug')
+    {}
   end
 
   def self.wait_for_viewport_width(driver, width)
