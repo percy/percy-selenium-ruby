@@ -461,8 +461,9 @@ module Percy
       end
 
       response_body = JSON.parse(response.body)
-      @cli_config = response_body['config']
-      @session_type = response_body['type']
+      response_body = {} unless response_body.is_a?(Hash)
+      @cli_config = sanitize_cli_config(response_body['config'])
+      @session_type = sanitize_session_type(response_body['type'])
       @percy_enabled = true
       true
     rescue StandardError => e
@@ -471,6 +472,34 @@ module Percy
       @percy_enabled = false
       false
     end
+  end
+
+  # Only keep a healthcheck `config` that is a Hash (with Hash-or-absent
+  # `snapshot` / `percy` sections). Anything else is ignored rather than
+  # disabling Percy, so snapshots still run with default config.
+  def self.sanitize_cli_config(config)
+    return nil if config.nil?
+
+    unless config.is_a?(Hash)
+      log('Ignoring malformed config in Percy CLI healthcheck response', 'debug')
+      return nil
+    end
+
+    %w[snapshot percy].each_with_object(config.dup) do |key, sanitized|
+      next if !sanitized.key?(key) || sanitized[key].is_a?(Hash)
+
+      log("Ignoring malformed '#{key}' config in Percy CLI healthcheck response", 'debug')
+      sanitized.delete(key)
+    end
+  end
+
+  # Only accept known session types; anything else is treated as absent
+  # (the same as an older CLI that does not report a type).
+  def self.sanitize_session_type(type)
+    return type if [SESSION_TYPE_WEB, SESSION_TYPE_AUTOMATE].include?(type)
+
+    log('Ignoring unknown session type in Percy CLI healthcheck response', 'debug') unless type.nil?
+    nil
   end
 
   def self.fetch_percy_dom

@@ -1692,6 +1692,69 @@ RSpec.describe Percy do
       expect { Percy.snapshot(driver, 'RejectedShot') }
         .to output(/Could not take DOM snapshot 'RejectedShot'/).to_stdout
     end
+
+    def stub_healthcheck_body(body)
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/healthcheck")
+        .to_return(status: 200, body: body.to_json,
+                   headers: {'x-percy-core-version': '1.0.0'},)
+      stub_request(:get, "#{Percy::PERCY_SERVER_ADDRESS}/percy/dom.js")
+        .to_return(status: 200, body: 'window.PercyDOM = {};', headers: {})
+      stub_request(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/snapshot")
+        .to_return(status: 200, body: '{"success":true}')
+    end
+
+    it 'still snapshots when the healthcheck config is not a Hash' do
+      stub_healthcheck_body(success: true, type: 'web', config: 'not-a-hash')
+
+      Percy.snapshot(driver, 'BadConfigShot')
+
+      expect(Percy.instance_variable_get(:@cli_config)).to be_nil
+      expect(WebMock).to have_requested(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/snapshot")
+        .with { |req| JSON.parse(req.body)['name'] == 'BadConfigShot' }.once
+    end
+
+    it 'drops malformed config sections but keeps valid ones' do
+      stub_healthcheck_body(
+        success: true, type: 'web',
+        config: {snapshot: ['bad'], percy: {deferUploads: false}, other: 1},
+      )
+
+      Percy.snapshot(driver, 'PartialConfigShot')
+
+      expect(Percy.instance_variable_get(:@cli_config))
+        .to eq('percy' => {'deferUploads' => false}, 'other' => 1)
+      expect(WebMock).to have_requested(:post, "#{Percy::PERCY_SERVER_ADDRESS}/percy/snapshot")
+        .with { |req| JSON.parse(req.body)['name'] == 'PartialConfigShot' }.once
+    end
+
+    it 'treats an unknown session type as absent and keeps Percy enabled' do
+      stub_healthcheck_body(success: true, type: '', config: {})
+
+      expect(Percy.percy_enabled?).to be true
+      expect(Percy.instance_variable_get(:@session_type)).to be_nil
+    end
+
+    it 'ignores a non-string session type' do
+      stub_healthcheck_body(success: true, type: ['automate'], config: {})
+
+      expect(Percy.percy_enabled?).to be true
+      expect(Percy.instance_variable_get(:@session_type)).to be_nil
+    end
+
+    it 'keeps a valid automate session type' do
+      stub_healthcheck_body(success: true, type: 'automate', config: {})
+
+      expect(Percy.percy_enabled?).to be true
+      expect(Percy.instance_variable_get(:@session_type)).to eq('automate')
+    end
+
+    it 'stays enabled when the healthcheck body is not a JSON object' do
+      stub_healthcheck_body(['unexpected'])
+
+      expect(Percy.percy_enabled?).to be true
+      expect(Percy.instance_variable_get(:@cli_config)).to be_nil
+      expect(Percy.instance_variable_get(:@session_type)).to be_nil
+    end
   end
 
   describe '.get_browser_instance' do
