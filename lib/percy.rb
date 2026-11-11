@@ -491,12 +491,21 @@ module Percy
       return nil
     end
 
-    %w[snapshot percy].each_with_object(config.dup) do |key, sanitized|
-      next if !sanitized.key?(key) || sanitized[key].is_a?(Hash)
+    sanitized = %w[snapshot percy].each_with_object(config.dup) do |key, result|
+      next if !result.key?(key) || result[key].is_a?(Hash)
 
       log("Ignoring malformed '#{key}' config in Percy CLI healthcheck response", 'debug')
-      sanitized.delete(key)
+      result.delete(key)
     end
+
+    # deferUploads is checked for truthiness, so a non-boolean such as "false" would
+    # wrongly disable responsive capture.
+    percy = sanitized['percy']
+    if percy&.key?('deferUploads') && ![true, false].include?(percy['deferUploads'])
+      log("Ignoring malformed 'deferUploads' config in Percy CLI healthcheck response", 'debug')
+      sanitized['percy'] = percy.reject { |k, _| k == 'deferUploads' }
+    end
+    sanitized
   end
 
   # Only accept known session types; anything else is treated as absent

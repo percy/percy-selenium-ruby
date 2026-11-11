@@ -1744,6 +1744,17 @@ RSpec.describe Percy do
         .with { |req| JSON.parse(req.body)['name'] == 'PartialConfigShot' }.once
     end
 
+    it 'drops a non-boolean deferUploads so it cannot disable responsive capture' do
+      stub_healthcheck_body(
+        success: true, type: 'web',
+        config: {percy: {deferUploads: 'false', other: 1}},
+      )
+
+      expect(Percy.percy_enabled?).to be true
+      expect(Percy.instance_variable_get(:@cli_config)).to eq('percy' => {'other' => 1})
+      expect(Percy.responsive_snapshot_capture?({responsive_snapshot_capture: true})).to be true
+    end
+
     it 'treats an unknown session type as absent and keeps Percy enabled' do
       stub_healthcheck_body(success: true, type: '', config: {})
 
