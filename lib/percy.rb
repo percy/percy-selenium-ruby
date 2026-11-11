@@ -12,6 +12,9 @@ module Percy
   SESSION_TYPE_AUTOMATE = 'automate'.freeze
   SESSION_TYPE_WEB = 'web'.freeze
 
+  # Upper bound for readiness.timeoutMs, matching the Percy CLI config schema.
+  MAX_READINESS_TIMEOUT_MS = 60_000
+
   PERCY_DEBUG = ENV['PERCY_LOGLEVEL'] == 'debug'
   PERCY_SERVER_ADDRESS = ENV['PERCY_SERVER_ADDRESS'] || 'http://localhost:5338'
   LABEL = "[\u001b[35m" + (PERCY_DEBUG ? 'percy:ruby' : 'percy') + "\u001b[39m]"
@@ -171,6 +174,9 @@ module Percy
     # default (~30s) firing ScriptTimeoutException before the in-page
     # Promise resolves.
     timeout_ms = readiness_config['timeoutMs']
+    if timeout_ms.is_a?(Numeric) && timeout_ms > MAX_READINESS_TIMEOUT_MS
+      timeout_ms = readiness_config['timeoutMs'] = MAX_READINESS_TIMEOUT_MS
+    end
     previous_timeout = nil
     if timeout_ms.is_a?(Numeric) && timeout_ms > 0
       begin
@@ -461,8 +467,9 @@ module Percy
       end
 
       response_body = JSON.parse(response.body)
-      @cli_config = response_body['config']
-      @session_type = response_body['type']
+      response_body = {} unless response_body.is_a?(Hash)
+      @cli_config = sanitize_cli_config(response_body['config'])
+      @session_type = sanitize_session_type(response_body['type'])
       @percy_enabled = true
       true
     rescue StandardError => e
@@ -471,6 +478,43 @@ module Percy
       @percy_enabled = false
       false
     end
+  end
+
+  # Only keep a healthcheck `config` that is a Hash (with Hash-or-absent
+  # `snapshot` / `percy` sections). Anything else is ignored rather than
+  # disabling Percy, so snapshots still run with default config.
+  def self.sanitize_cli_config(config)
+    return nil if config.nil?
+
+    unless config.is_a?(Hash)
+      log('Ignoring malformed config in Percy CLI healthcheck response', 'debug')
+      return nil
+    end
+
+    sanitized = %w[snapshot percy].each_with_object(config.dup) do |key, result|
+      next if !result.key?(key) || result[key].is_a?(Hash)
+
+      log("Ignoring malformed '#{key}' config in Percy CLI healthcheck response", 'debug')
+      result.delete(key)
+    end
+
+    # deferUploads is checked for truthiness, so a non-boolean such as "false" would
+    # wrongly disable responsive capture.
+    percy = sanitized['percy']
+    if percy&.key?('deferUploads') && ![true, false].include?(percy['deferUploads'])
+      log("Ignoring malformed 'deferUploads' config in Percy CLI healthcheck response", 'debug')
+      sanitized['percy'] = percy.reject { |k, _| k == 'deferUploads' }
+    end
+    sanitized
+  end
+
+  # Only accept known session types; anything else is treated as absent
+  # (the same as an older CLI that does not report a type).
+  def self.sanitize_session_type(type)
+    return type if [SESSION_TYPE_WEB, SESSION_TYPE_AUTOMATE].include?(type)
+
+    log('Ignoring unknown session type in Percy CLI healthcheck response', 'debug') unless type.nil?
+    nil
   end
 
   def self.fetch_percy_dom
