@@ -981,6 +981,23 @@ RSpec.describe Percy do
       Percy.get_serialized_dom(driver, readiness: {timeoutMs: 8000})
     end
 
+    it 'caps readiness timeoutMs at the CLI maximum' do
+      timeouts = double('timeouts')
+      allow(manage).to receive(:timeouts).and_return(timeouts)
+      allow(timeouts).to receive(:script_timeout).and_return(30)
+      allow(driver).to receive(:execute_script).and_return({'html' => '<html/>'})
+      allow(driver).to receive(:current_url).and_return('http://main.example.com/')
+      allow(driver).to receive(:find_elements).and_return([])
+
+      # 86_400_000ms is capped to 60s + 2s buffer, and the in-page config is capped too.
+      expect(timeouts).to receive(:script_timeout=).with(62.0).ordered
+      expect(timeouts).to receive(:script_timeout=).with(30).ordered
+      expect(driver).to receive(:execute_async_script)
+        .with(include('"timeoutMs":60000')).and_return(nil)
+
+      Percy.get_serialized_dom(driver, readiness: {timeoutMs: 86_400_000})
+    end
+
     it 'proceeds when reading/setting the script timeout is unsupported' do
       timeouts = double('timeouts')
       allow(manage).to receive(:timeouts).and_return(timeouts)

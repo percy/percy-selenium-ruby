@@ -12,6 +12,9 @@ module Percy
   SESSION_TYPE_AUTOMATE = 'automate'.freeze
   SESSION_TYPE_WEB = 'web'.freeze
 
+  # Upper bound for readiness.timeoutMs, matching the Percy CLI config schema.
+  MAX_READINESS_TIMEOUT_MS = 60_000
+
   PERCY_DEBUG = ENV['PERCY_LOGLEVEL'] == 'debug'
   PERCY_SERVER_ADDRESS = ENV['PERCY_SERVER_ADDRESS'] || 'http://localhost:5338'
   LABEL = "[\u001b[35m" + (PERCY_DEBUG ? 'percy:ruby' : 'percy') + "\u001b[39m]"
@@ -171,6 +174,9 @@ module Percy
     # default (~30s) firing ScriptTimeoutException before the in-page
     # Promise resolves.
     timeout_ms = readiness_config['timeoutMs']
+    if timeout_ms.is_a?(Numeric) && timeout_ms > MAX_READINESS_TIMEOUT_MS
+      timeout_ms = readiness_config['timeoutMs'] = MAX_READINESS_TIMEOUT_MS
+    end
     previous_timeout = nil
     if timeout_ms.is_a?(Numeric) && timeout_ms > 0
       begin
