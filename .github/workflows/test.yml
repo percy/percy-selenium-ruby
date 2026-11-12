@@ -4,11 +4,6 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
-    inputs:
-      branch:
-        required: false
-        type: string
-        default: master
 permissions:
   contents: read
 jobs:
@@ -20,15 +15,6 @@ jobs:
         ruby: ['2.6', '2.7']
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions-ecosystem/action-regex-match@9e6c4fb3d5e898f505be7a1fb6e7b0a278f6665b # v2.0.2
-        id: regex-match
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        with:
-          text: ${{ github.event.inputs.branch }}
-          regex: '^[a-zA-Z0-9_/\-]+$'
-      - name: Break on invalid branch name
-        run: exit 1
-        if: ${{ github.event_name == 'workflow_dispatch' && steps.regex-match.outputs && steps.regex-match.outputs.match == '' }}
       - uses: actions/checkout@0717577d45739eb3c851188b29f50ed6c0b2194e # v2.8.0
         with:
           persist-credentials: false
@@ -53,27 +39,4 @@ jobs:
           key: v1/${{ runner.os }}/node-${{ matrix.node }}/${{ hashFiles('**/yarn.lock') }}
           restore-keys: v1/${{ runner.os }}/node-${{ matrix.node }}/
       - run: yarn
-      - name: Set up @percy/cli from git
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        env:
-          BRANCH: ${{ github.event.inputs.branch }}
-        run: |
-          cd /tmp
-          git clone --branch "$BRANCH" --depth 1 https://github.com/percy/cli
-          cd cli
-          PERCY_PACKAGES=`find packages -mindepth 1 -maxdepth 1 -type d | sed -e 's/packages/@percy/g' | tr '\n' ' '`
-          git log -1
-          yarn
-          yarn build
-          yarn global:link
-          # Expose the freshly built `percy` on PATH. yarn link symlinks the
-          # package but not its bin, so `npx percy` would miss it and download
-          # the unrelated public `percy`. Link is best-effort; PATH is what
-          # makes percy resolvable.
-          echo "$(yarn global bin)" >> "$GITHUB_PATH"
-          export PATH="$(yarn global bin):$PATH"
-          cd ${{ github.workspace }}
-          yarn remove @percy/cli >/dev/null 2>&1 || true
-          yarn link `echo $PERCY_PACKAGES` >/dev/null 2>&1 || true
-          percy --version
       - run: npx percy exec --testing -- bundle exec rspec
