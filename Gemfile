@@ -13,7 +13,7 @@ group :test, :development do
   gem "puma", '~> 5'
   # Puma 5's rack handler requires `rack/handler`, which Rack 3 removed (it
   # moved to the separate `rackup` gem). Pin Rack 2 so Capybara can boot Puma.
-  gem "rack", '~> 2.2'
+  gem "rack", '~> 3.2'
   gem "pry"
   gem "simplecov", require: false
 end
